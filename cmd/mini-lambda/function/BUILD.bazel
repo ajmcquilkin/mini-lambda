@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "function",
+    srcs = ["function.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/cmd/mini-lambda/function",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cmd/mini-lambda/function/create",
+        "//cmd/mini-lambda/function/delete",
+        "//cmd/mini-lambda/function/get",
+        "//cmd/mini-lambda/function/invoke",
+        "//cmd/mini-lambda/function/list",
+        "//cmd/mini-lambda/function/logs",
+        "//cmd/mini-lambda/function/update",
+        "@com_github_spf13_cobra//:cobra",
+    ],
+)

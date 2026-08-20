@@ -1,0 +1,15 @@
+# Bazel symlinks
+/bazel-*
+
+# Bazel disk cache / user config
+.bazelrc.user
+
+# Go build & test artifacts
+/bin/
+*.test
+*.out
+*.exe
+
+# Editor / OS junk
+.DS_Store
+*.swp

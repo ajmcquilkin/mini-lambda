@@ -1,0 +1,4 @@
+load("@gazelle//:def.bzl", "gazelle")
+
+# gazelle:prefix github.com/ajmcquilkin/mini-lambda
+gazelle(name = "gazelle")
