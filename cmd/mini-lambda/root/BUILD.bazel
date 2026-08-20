@@ -1,0 +1,13 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "root",
+    srcs = ["root.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/cmd/mini-lambda/root",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cmd/mini-lambda/function",
+        "//cmd/mini-lambda/serve",
+        "@com_github_spf13_cobra//:cobra",
+    ],
+)

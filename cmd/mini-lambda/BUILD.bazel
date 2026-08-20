@@ -1,0 +1,15 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "mini-lambda_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/cmd/mini-lambda",
+    visibility = ["//visibility:private"],
+    deps = ["//cmd/mini-lambda/root"],
+)
+
+go_binary(
+    name = "mini-lambda",
+    embed = [":mini-lambda_lib"],
+    visibility = ["//visibility:public"],
+)
