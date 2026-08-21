@@ -1,4 +1,4 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "daemon",
@@ -8,10 +8,23 @@ go_library(
     deps = [
         "//internal/api",
         "//internal/apierror",
+        "//internal/model",
         "//internal/runtime",
         "//internal/runtime/docker",
         "//internal/runtimeapi",
         "//internal/scheduler",
         "//internal/store",
+    ],
+)
+
+go_test(
+    name = "daemon_test",
+    srcs = ["daemon_test.go"],
+    embed = [":daemon"],
+    deps = [
+        "//internal/model",
+        "//internal/store",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
 )
