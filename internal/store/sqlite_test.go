@@ -1,7 +1,6 @@
 package store
 
 import (
-	"context"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -18,7 +17,7 @@ func newTestStore(t *testing.T) *SQLite {
 		t.Fatalf("Open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() })
-	if err := s.Migrate(context.Background()); err != nil {
+	if err := s.Migrate(t.Context()); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	return s
@@ -40,17 +39,17 @@ func sampleFn(name string) *model.Function {
 func TestMigrateIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	// Migrate again; ErrNoChange must be swallowed.
-	if err := s.Migrate(context.Background()); err != nil {
+	if err := s.Migrate(t.Context()); err != nil {
 		t.Fatalf("second Migrate: %v", err)
 	}
-	if err := s.Migrate(context.Background()); err != nil {
+	if err := s.Migrate(t.Context()); err != nil {
 		t.Fatalf("third Migrate: %v", err)
 	}
 }
 
 func TestCreateAndGet(t *testing.T) {
 	s := newTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	want := sampleFn("alpha")
 
 	if err := s.CreateFunction(ctx, want); err != nil {
@@ -80,7 +79,7 @@ func TestCreateAndGet(t *testing.T) {
 
 func TestCreateConflict(t *testing.T) {
 	s := newTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	fn := sampleFn("dup")
 	if err := s.CreateFunction(ctx, fn); err != nil {
 		t.Fatalf("first create: %v", err)
@@ -93,7 +92,7 @@ func TestCreateConflict(t *testing.T) {
 
 func TestGetNotFound(t *testing.T) {
 	s := newTestStore(t)
-	_, err := s.GetFunction(context.Background(), "nope")
+	_, err := s.GetFunction(t.Context(), "nope")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -101,7 +100,7 @@ func TestGetNotFound(t *testing.T) {
 
 func TestList(t *testing.T) {
 	s := newTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	empty, err := s.ListFunctions(ctx)
 	if err != nil {
@@ -134,7 +133,7 @@ func TestList(t *testing.T) {
 
 func TestUpdate(t *testing.T) {
 	s := newTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	fn := sampleFn("upd")
 	if err := s.CreateFunction(ctx, fn); err != nil {
 		t.Fatalf("create: %v", err)
@@ -174,7 +173,7 @@ func TestUpdate(t *testing.T) {
 
 func TestUpdateNotFound(t *testing.T) {
 	s := newTestStore(t)
-	err := s.UpdateFunctionConfiguration(context.Background(), sampleFn("ghost"))
+	err := s.UpdateFunctionConfiguration(t.Context(), sampleFn("ghost"))
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -182,7 +181,7 @@ func TestUpdateNotFound(t *testing.T) {
 
 func TestDelete(t *testing.T) {
 	s := newTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := s.CreateFunction(ctx, sampleFn("del")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -196,7 +195,7 @@ func TestDelete(t *testing.T) {
 
 func TestDeleteNotFound(t *testing.T) {
 	s := newTestStore(t)
-	err := s.DeleteFunction(context.Background(), "ghost")
+	err := s.DeleteFunction(t.Context(), "ghost")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -204,7 +203,7 @@ func TestDeleteNotFound(t *testing.T) {
 
 func TestEmptyEnvRoundTrip(t *testing.T) {
 	s := newTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	fn := sampleFn("noenv")
 	fn.Env = nil
 	if err := s.CreateFunction(ctx, fn); err != nil {
