@@ -23,6 +23,11 @@ go_test(
     deps = [
         "//internal/apierror",
         "//internal/model",
+        "//internal/scheduler/schedulermock",
         "//internal/store",
+        "//internal/store/storemock",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@org_uber_go_mock//gomock",
     ],
 )

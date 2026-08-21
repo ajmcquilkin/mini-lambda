@@ -9,303 +9,256 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
 	"github.com/ajmcquilkin/mini-lambda/internal/apierror"
 	"github.com/ajmcquilkin/mini-lambda/internal/model"
+	"github.com/ajmcquilkin/mini-lambda/internal/scheduler/schedulermock"
 	"github.com/ajmcquilkin/mini-lambda/internal/store"
+	"github.com/ajmcquilkin/mini-lambda/internal/store/storemock"
 )
 
-// fakeStore is an in-memory store.Store honoring the ErrConflict/ErrNotFound
-// sentinels.
-type fakeStore struct {
-	fns map[string]*model.Function
+func newAPI(t *testing.T) (http.Handler, *storemock.MockStore, *schedulermock.MockScheduler) {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	st := storemock.NewMockStore(ctrl)
+	sched := schedulermock.NewMockScheduler(ctrl)
+	return New(st, sched), st, sched
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{fns: map[string]*model.Function{}} }
-
-func (f *fakeStore) Migrate(context.Context) error { return nil }
-
-func (f *fakeStore) CreateFunction(_ context.Context, fn *model.Function) error {
-	if _, ok := f.fns[fn.Name]; ok {
-		return store.ErrConflict
-	}
-	cp := *fn
-	f.fns[fn.Name] = &cp
-	return nil
-}
-
-func (f *fakeStore) GetFunction(_ context.Context, name string) (*model.Function, error) {
-	fn, ok := f.fns[name]
-	if !ok {
-		return nil, store.ErrNotFound
-	}
-	cp := *fn
-	return &cp, nil
-}
-
-func (f *fakeStore) ListFunctions(context.Context) ([]*model.Function, error) {
-	out := make([]*model.Function, 0, len(f.fns))
-	for _, fn := range f.fns {
-		cp := *fn
-		out = append(out, &cp)
-	}
-	return out, nil
-}
-
-func (f *fakeStore) UpdateFunctionConfiguration(_ context.Context, fn *model.Function) error {
-	if _, ok := f.fns[fn.Name]; !ok {
-		return store.ErrNotFound
-	}
-	cp := *fn
-	f.fns[fn.Name] = &cp
-	return nil
-}
-
-func (f *fakeStore) DeleteFunction(_ context.Context, name string) error {
-	if _, ok := f.fns[name]; !ok {
-		return store.ErrNotFound
-	}
-	delete(f.fns, name)
-	return nil
-}
-
-func (f *fakeStore) Close() error { return nil }
-
-// fakeScheduler dispatches Invoke to a configurable function.
-type fakeScheduler struct {
-	invoke func(ctx context.Context, name string, payload []byte) (*model.InvokeResult, error)
-}
-
-func (f *fakeScheduler) Invoke(ctx context.Context, name string, payload []byte) (*model.InvokeResult, error) {
-	return f.invoke(ctx, name, payload)
-}
-
-func (f *fakeScheduler) Shutdown(context.Context) error { return nil }
-
-func do(t *testing.T, h http.Handler, method, path string, body string) *httptest.ResponseRecorder {
+// do issues a request carrying the test's context and returns the recorder.
+func do(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var r io.Reader
 	if body != "" {
 		r = strings.NewReader(body)
 	}
-	req := httptest.NewRequest(method, path, r)
+	req := httptest.NewRequestWithContext(t.Context(), method, path, r)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
 }
 
+func decodeError(t *testing.T, rec *httptest.ResponseRecorder) apierror.Error {
+	t.Helper()
+	var e apierror.Error
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &e))
+	return e
+}
+
 func TestCreateFunction(t *testing.T) {
-	h := New(newFakeStore(), &fakeScheduler{})
-	rec := do(t, h, http.MethodPost, routeFunctions, `{"FunctionName":"hello","Code":{"ImageUri":"img:latest"},"Environment":{"Variables":{"A":"1"}},"MemorySize":256,"Timeout":15}`)
+	tests := []struct {
+		name       string
+		body       string
+		expect     func(st *storemock.MockStore)
+		wantStatus int
+		wantCode   string
+		check      func(t *testing.T, cfg FunctionConfiguration)
+	}{
+		{
+			name: "success",
+			body: `{"FunctionName":"hello","Code":{"ImageUri":"img:latest"},"Environment":{"Variables":{"A":"1"}},"MemorySize":256,"Timeout":15}`,
+			expect: func(st *storemock.MockStore) {
+				st.EXPECT().CreateFunction(gomock.Any(), gomock.Any()).Return(nil)
+			},
+			wantStatus: http.StatusCreated,
+			check: func(t *testing.T, cfg FunctionConfiguration) {
+				assert.Equal(t, "hello", cfg.FunctionName)
+				assert.Equal(t, "img:latest", cfg.Code.ImageUri)
+				assert.Equal(t, 256, cfg.MemorySize)
+				assert.Equal(t, 15, cfg.Timeout)
+				require.NotNil(t, cfg.Environment)
+				assert.Equal(t, "1", cfg.Environment.Variables["A"])
+				assert.NotEmpty(t, cfg.FunctionArn)
+			},
+		},
+		{
+			name: "defaults applied",
+			body: `{"FunctionName":"h","Code":{"ImageUri":"img"}}`,
+			expect: func(st *storemock.MockStore) {
+				st.EXPECT().CreateFunction(gomock.Any(), gomock.Any()).Return(nil)
+			},
+			wantStatus: http.StatusCreated,
+			check: func(t *testing.T, cfg FunctionConfiguration) {
+				assert.Equal(t, DefaultMemorySize, cfg.MemorySize)
+				assert.Equal(t, DefaultTimeout, cfg.Timeout)
+			},
+		},
+		{
+			name:       "missing name",
+			body:       `{"Code":{"ImageUri":"img"}}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   apierror.CodeInvalidParameterValue,
+		},
+		{
+			name:       "missing image",
+			body:       `{"FunctionName":"h"}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   apierror.CodeInvalidParameterValue,
+		},
+		{
+			name: "conflict",
+			body: `{"FunctionName":"dup","Code":{"ImageUri":"img"}}`,
+			expect: func(st *storemock.MockStore) {
+				st.EXPECT().CreateFunction(gomock.Any(), gomock.Any()).Return(store.ErrConflict)
+			},
+			wantStatus: http.StatusConflict,
+			wantCode:   apierror.CodeResourceConflict,
+		},
+	}
 
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201; body=%s", rec.Code, rec.Body.String())
-	}
-	var cfg FunctionConfiguration
-	if err := json.Unmarshal(rec.Body.Bytes(), &cfg); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if cfg.FunctionName != "hello" || cfg.Code.ImageUri != "img:latest" || cfg.MemorySize != 256 || cfg.Timeout != 15 {
-		t.Fatalf("unexpected config: %+v", cfg)
-	}
-	if cfg.Environment == nil || cfg.Environment.Variables["A"] != "1" {
-		t.Fatalf("environment not echoed: %+v", cfg.Environment)
-	}
-	if cfg.FunctionArn == "" {
-		t.Fatalf("expected FunctionArn to be populated")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, st, _ := newAPI(t)
+			if tt.expect != nil {
+				tt.expect(st)
+			}
+
+			rec := do(t, h, http.MethodPost, routeFunctions, tt.body)
+			require.Equal(t, tt.wantStatus, rec.Code, "body=%s", rec.Body.String())
+
+			if tt.wantCode != "" {
+				e := decodeError(t, rec)
+				assert.Equal(t, tt.wantCode, e.Code)
+				assert.Equal(t, tt.wantCode, rec.Header().Get("X-Amzn-Errortype"))
+				return
+			}
+			var cfg FunctionConfiguration
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &cfg))
+			if tt.check != nil {
+				tt.check(t, cfg)
+			}
+		})
 	}
 }
 
-func TestCreateFunctionDefaults(t *testing.T) {
-	h := New(newFakeStore(), &fakeScheduler{})
-	rec := do(t, h, http.MethodPost, routeFunctions, `{"FunctionName":"h","Code":{"ImageUri":"img"}}`)
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("status = %d, want 201", rec.Code)
-	}
-	var cfg FunctionConfiguration
-	_ = json.Unmarshal(rec.Body.Bytes(), &cfg)
-	if cfg.MemorySize != DefaultMemorySize || cfg.Timeout != DefaultTimeout {
-		t.Fatalf("defaults not applied: mem=%d timeout=%d", cfg.MemorySize, cfg.Timeout)
-	}
-}
+func TestGetFunction(t *testing.T) {
+	t.Run("found", func(t *testing.T) {
+		h, st, _ := newAPI(t)
+		st.EXPECT().GetFunction(gomock.Any(), "hello").Return(&model.Function{Name: "hello", Image: "img", MemoryMB: 128, TimeoutSec: 5}, nil)
 
-func TestCreateFunctionValidation(t *testing.T) {
-	h := New(newFakeStore(), &fakeScheduler{})
-	rec := do(t, h, http.MethodPost, routeFunctions, `{"Code":{"ImageUri":"img"}}`)
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400", rec.Code)
-	}
-	assertErrorCode(t, rec, apierror.CodeInvalidParameterValue)
-}
+		rec := do(t, h, http.MethodGet, routeFunctions+"/hello", "")
+		require.Equal(t, http.StatusOK, rec.Code)
+		var cfg FunctionConfiguration
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &cfg))
+		assert.Equal(t, "hello", cfg.FunctionName)
+	})
 
-func TestCreateFunctionConflict(t *testing.T) {
-	st := newFakeStore()
-	h := New(st, &fakeScheduler{})
-	body := `{"FunctionName":"dup","Code":{"ImageUri":"img"}}`
-	if rec := do(t, h, http.MethodPost, routeFunctions, body); rec.Code != http.StatusCreated {
-		t.Fatalf("setup create status = %d", rec.Code)
-	}
-	rec := do(t, h, http.MethodPost, routeFunctions, body)
-	if rec.Code != http.StatusConflict {
-		t.Fatalf("status = %d, want 409", rec.Code)
-	}
-	assertErrorCode(t, rec, apierror.CodeResourceConflict)
-}
+	t.Run("not found", func(t *testing.T) {
+		h, st, _ := newAPI(t)
+		st.EXPECT().GetFunction(gomock.Any(), "missing").Return(nil, store.ErrNotFound)
 
-func TestGetFunctionNotFound(t *testing.T) {
-	h := New(newFakeStore(), &fakeScheduler{})
-	rec := do(t, h, http.MethodGet, routeFunctions+"/missing", "")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
-	assertErrorCode(t, rec, apierror.CodeResourceNotFound)
+		rec := do(t, h, http.MethodGet, routeFunctions+"/missing", "")
+		require.Equal(t, http.StatusNotFound, rec.Code)
+		assert.Equal(t, apierror.CodeResourceNotFound, decodeError(t, rec).Code)
+	})
 }
 
 func TestListFunctions(t *testing.T) {
-	st := newFakeStore()
-	h := New(st, &fakeScheduler{})
-	do(t, h, http.MethodPost, routeFunctions, `{"FunctionName":"a","Code":{"ImageUri":"img"}}`)
-	do(t, h, http.MethodPost, routeFunctions, `{"FunctionName":"b","Code":{"ImageUri":"img"}}`)
+	h, st, _ := newAPI(t)
+	st.EXPECT().ListFunctions(gomock.Any()).Return([]*model.Function{
+		{Name: "a", Image: "img"},
+		{Name: "b", Image: "img"},
+	}, nil)
 
 	rec := do(t, h, http.MethodGet, routeFunctions, "")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
+	require.Equal(t, http.StatusOK, rec.Code)
 	var resp ListFunctionsResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if len(resp.Functions) != 2 {
-		t.Fatalf("got %d functions, want 2", len(resp.Functions))
-	}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	assert.Len(t, resp.Functions, 2)
 }
 
 func TestUpdateFunctionConfiguration(t *testing.T) {
-	st := newFakeStore()
-	h := New(st, &fakeScheduler{})
-	do(t, h, http.MethodPost, routeFunctions, `{"FunctionName":"c","Code":{"ImageUri":"img"},"MemorySize":128,"Timeout":5}`)
+	t.Run("partial update", func(t *testing.T) {
+		h, st, _ := newAPI(t)
+		gomock.InOrder(
+			st.EXPECT().GetFunction(gomock.Any(), "c").
+				Return(&model.Function{Name: "c", Image: "img", MemoryMB: 128, TimeoutSec: 5}, nil),
+			st.EXPECT().UpdateFunctionConfiguration(gomock.Any(), gomock.Any()).
+				DoAndReturn(func(_ context.Context, fn *model.Function) error {
+					assert.Equal(t, 1024, fn.MemoryMB)
+					assert.Equal(t, 5, fn.TimeoutSec) // unchanged
+					assert.Equal(t, "V", fn.Env["K"])
+					return nil
+				}),
+		)
 
-	rec := do(t, h, http.MethodPut, routeFunctions+"/c/configuration", `{"MemorySize":1024,"Environment":{"Variables":{"K":"V"}}}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
-	}
-	var cfg FunctionConfiguration
-	_ = json.Unmarshal(rec.Body.Bytes(), &cfg)
-	if cfg.MemorySize != 1024 {
-		t.Fatalf("memory not updated: %d", cfg.MemorySize)
-	}
-	if cfg.Timeout != 5 {
-		t.Fatalf("timeout should be unchanged: %d", cfg.Timeout)
-	}
-	if cfg.Environment == nil || cfg.Environment.Variables["K"] != "V" {
-		t.Fatalf("env not updated: %+v", cfg.Environment)
-	}
-}
+		rec := do(t, h, http.MethodPut, routeFunctions+"/c/configuration", `{"MemorySize":1024,"Environment":{"Variables":{"K":"V"}}}`)
+		require.Equal(t, http.StatusOK, rec.Code, "body=%s", rec.Body.String())
+		var cfg FunctionConfiguration
+		require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &cfg))
+		assert.Equal(t, 1024, cfg.MemorySize)
+		assert.Equal(t, 5, cfg.Timeout)
+	})
 
-func TestUpdateFunctionNotFound(t *testing.T) {
-	h := New(newFakeStore(), &fakeScheduler{})
-	rec := do(t, h, http.MethodPut, routeFunctions+"/nope/configuration", `{"MemorySize":10}`)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
+	t.Run("not found", func(t *testing.T) {
+		h, st, _ := newAPI(t)
+		st.EXPECT().GetFunction(gomock.Any(), "nope").Return(nil, store.ErrNotFound)
+
+		rec := do(t, h, http.MethodPut, routeFunctions+"/nope/configuration", `{"MemorySize":10}`)
+		require.Equal(t, http.StatusNotFound, rec.Code)
+	})
 }
 
 func TestDeleteFunction(t *testing.T) {
-	st := newFakeStore()
-	h := New(st, &fakeScheduler{})
-	do(t, h, http.MethodPost, routeFunctions, `{"FunctionName":"d","Code":{"ImageUri":"img"}}`)
+	t.Run("success", func(t *testing.T) {
+		h, st, _ := newAPI(t)
+		st.EXPECT().DeleteFunction(gomock.Any(), "d").Return(nil)
 
-	rec := do(t, h, http.MethodDelete, routeFunctions+"/d", "")
-	if rec.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want 204", rec.Code)
-	}
-	if rec.Body.Len() != 0 {
-		t.Fatalf("expected empty body, got %q", rec.Body.String())
-	}
-	// second delete -> 404
-	if rec := do(t, h, http.MethodDelete, routeFunctions+"/d", ""); rec.Code != http.StatusNotFound {
-		t.Fatalf("second delete status = %d, want 404", rec.Code)
-	}
+		rec := do(t, h, http.MethodDelete, routeFunctions+"/d", "")
+		require.Equal(t, http.StatusNoContent, rec.Code)
+		assert.Zero(t, rec.Body.Len())
+	})
+
+	t.Run("not found", func(t *testing.T) {
+		h, st, _ := newAPI(t)
+		st.EXPECT().DeleteFunction(gomock.Any(), "d").Return(store.ErrNotFound)
+
+		rec := do(t, h, http.MethodDelete, routeFunctions+"/d", "")
+		require.Equal(t, http.StatusNotFound, rec.Code)
+	})
 }
 
-func TestInvokeSuccess(t *testing.T) {
-	sched := &fakeScheduler{invoke: func(_ context.Context, name string, payload []byte) (*model.InvokeResult, error) {
-		if name != "fn" {
-			t.Fatalf("unexpected name %q", name)
-		}
-		return &model.InvokeResult{Payload: append([]byte("echo:"), payload...), StatusCode: 200}, nil
-	}}
-	h := New(newFakeStore(), sched)
+func TestInvoke(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		h, _, sched := newAPI(t)
+		sched.EXPECT().Invoke(gomock.Any(), "fn", []byte(`{"x":1}`)).
+			Return(&model.InvokeResult{Payload: []byte(`{"ok":true}`), StatusCode: 200}, nil)
 
-	rec := do(t, h, http.MethodPost, routeFunctions+"/fn/invocations", `{"x":1}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	if got := rec.Body.String(); got != `echo:{"x":1}` {
-		t.Fatalf("payload = %q", got)
-	}
-	if rec.Header().Get("X-Amz-Function-Error") != "" {
-		t.Fatalf("unexpected function-error header")
-	}
-}
+		rec := do(t, h, http.MethodPost, routeFunctions+"/fn/invocations", `{"x":1}`)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, `{"ok":true}`, rec.Body.String())
+		assert.Empty(t, rec.Header().Get("X-Amz-Function-Error"))
+	})
 
-func TestInvokeHandlerError(t *testing.T) {
-	sched := &fakeScheduler{invoke: func(context.Context, string, []byte) (*model.InvokeResult, error) {
-		return &model.InvokeResult{
-			Payload:       []byte(`{"errorMessage":"boom"}`),
-			FunctionError: "boom",
-			StatusCode:    200,
-		}, nil
-	}}
-	h := New(newFakeStore(), sched)
+	t.Run("handler error", func(t *testing.T) {
+		h, _, sched := newAPI(t)
+		sched.EXPECT().Invoke(gomock.Any(), "fn", gomock.Any()).
+			Return(&model.InvokeResult{Payload: []byte(`{"errorMessage":"boom"}`), FunctionError: "boom", StatusCode: 200}, nil)
 
-	rec := do(t, h, http.MethodPost, routeFunctions+"/fn/invocations", `{}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
-	}
-	if got := rec.Header().Get("X-Amz-Function-Error"); got != "Unhandled" {
-		t.Fatalf("X-Amz-Function-Error = %q, want Unhandled", got)
-	}
-	if got := rec.Body.String(); got != `{"errorMessage":"boom"}` {
-		t.Fatalf("payload = %q", got)
-	}
-}
+		rec := do(t, h, http.MethodPost, routeFunctions+"/fn/invocations", `{}`)
+		require.Equal(t, http.StatusOK, rec.Code)
+		assert.Equal(t, "Unhandled", rec.Header().Get("X-Amz-Function-Error"))
+		assert.Equal(t, `{"errorMessage":"boom"}`, rec.Body.String())
+	})
 
-func TestInvokeThrottle(t *testing.T) {
-	sched := &fakeScheduler{invoke: func(context.Context, string, []byte) (*model.InvokeResult, error) {
-		return nil, apierror.Throttled("at capacity")
-	}}
-	h := New(newFakeStore(), sched)
+	t.Run("throttle", func(t *testing.T) {
+		h, _, sched := newAPI(t)
+		sched.EXPECT().Invoke(gomock.Any(), "fn", gomock.Any()).Return(nil, apierror.Throttled("at capacity"))
 
-	rec := do(t, h, http.MethodPost, routeFunctions+"/fn/invocations", `{}`)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want 429", rec.Code)
-	}
-	assertErrorCode(t, rec, apierror.CodeTooManyRequests)
-}
+		rec := do(t, h, http.MethodPost, routeFunctions+"/fn/invocations", `{}`)
+		require.Equal(t, http.StatusTooManyRequests, rec.Code)
+		assert.Equal(t, apierror.CodeTooManyRequests, decodeError(t, rec).Code)
+	})
 
-func TestInvokeUnknownFunction(t *testing.T) {
-	sched := &fakeScheduler{invoke: func(context.Context, string, []byte) (*model.InvokeResult, error) {
-		return nil, store.ErrNotFound
-	}}
-	h := New(newFakeStore(), sched)
+	t.Run("unknown function", func(t *testing.T) {
+		h, _, sched := newAPI(t)
+		sched.EXPECT().Invoke(gomock.Any(), "ghost", gomock.Any()).Return(nil, store.ErrNotFound)
 
-	rec := do(t, h, http.MethodPost, routeFunctions+"/ghost/invocations", `{}`)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
-	assertErrorCode(t, rec, apierror.CodeResourceNotFound)
-}
-
-func assertErrorCode(t *testing.T, rec *httptest.ResponseRecorder, code string) {
-	t.Helper()
-	var e apierror.Error
-	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
-		t.Fatalf("decode error envelope: %v (body=%s)", err, rec.Body.String())
-	}
-	if e.Code != code {
-		t.Fatalf("error code = %q, want %q", e.Code, code)
-	}
-	if rec.Header().Get("X-Amzn-Errortype") != code {
-		t.Fatalf("X-Amzn-Errortype = %q, want %q", rec.Header().Get("X-Amzn-Errortype"), code)
-	}
+		rec := do(t, h, http.MethodPost, routeFunctions+"/ghost/invocations", `{}`)
+		require.Equal(t, http.StatusNotFound, rec.Code)
+		assert.Equal(t, apierror.CodeResourceNotFound, decodeError(t, rec).Code)
+	})
 }
