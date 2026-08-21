@@ -6,7 +6,7 @@ go_library(
     importpath = "github.com/ajmcquilkin/mini-lambda/cmd/mini-lambda/serve",
     visibility = ["//visibility:public"],
     deps = [
+        "//internal/daemon",
         "@com_github_spf13_cobra//:cobra",
-        "@com_github_spf13_viper//:viper",
     ],
 )

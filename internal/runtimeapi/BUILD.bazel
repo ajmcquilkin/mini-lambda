@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "runtimeapi",
+    srcs = ["runtimeapi.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/internal/runtimeapi",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "runtimeapi_test",
+    srcs = ["runtimeapi_test.go"],
+    embed = [":runtimeapi"],
+    deps = [
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
+)

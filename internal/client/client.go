@@ -116,6 +116,26 @@ func (c *Client) Invoke(name string, payload []byte) (*InvokeOutput, error) {
 	}, nil
 }
 
+// Logs streams a function's live logs. The returned ReadCloser yields the raw
+// combined container output; the caller must Close it. When follow is true the
+// stream stays open until the daemon closes it (e.g. the slot dies) or the
+// reader is closed. Logs are live-only: only currently-running slots contribute.
+func (c *Client) Logs(name string, follow bool) (io.ReadCloser, error) {
+	path := "/mini-lambda/functions/" + name + "/logs"
+	if follow {
+		path += "?follow=true"
+	}
+	resp, err := c.doRaw(http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := errorFor(resp); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
 // doConfig performs a request whose success body is a FunctionConfiguration.
 func (c *Client) doConfig(method, path string, body any) (*api.FunctionConfiguration, error) {
 	resp, err := c.do(method, path, body)

@@ -1,0 +1,12 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "runtimemock",
+    srcs = ["mock_runtime.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/internal/runtime/runtimemock",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/runtime",
+        "@org_uber_go_mock//gomock",
+    ],
+)
