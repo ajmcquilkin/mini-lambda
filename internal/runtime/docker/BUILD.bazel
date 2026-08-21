@@ -1,0 +1,25 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "docker",
+    srcs = ["docker.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/internal/runtime/docker",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/runtime",
+        "@com_github_docker_docker//api/types/container",
+        "@com_github_docker_docker//api/types/image",
+        "@com_github_docker_docker//client",
+        "@com_github_docker_docker//pkg/stdcopy",
+    ],
+)
+
+go_test(
+    name = "docker_test",
+    srcs = [
+        "docker_integration_test.go",
+        "docker_test.go",
+    ],
+    embed = [":docker"],
+    deps = ["//internal/runtime"],
+)
