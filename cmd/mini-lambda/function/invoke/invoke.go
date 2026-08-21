@@ -7,6 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/ajmcquilkin/mini-lambda/cmd/mini-lambda/internal/cli"
 	"github.com/ajmcquilkin/mini-lambda/internal/client"
 )
 
@@ -17,7 +18,7 @@ func NewCmd() *cobra.Command {
 		Short: "Invoke a function with an event payload",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			host, _ := cmd.Flags().GetString("host")
+			host := cli.ResolveHost(cmd)
 
 			payload, err := readPayload(cmd)
 			if err != nil {
@@ -44,18 +45,11 @@ func NewCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().String("host", defaultHost(), "mini-lambda daemon address (env MINI_LAMBDA_HOST)")
+	cli.AddHostFlag(cmd)
 	cmd.Flags().String("payload", "", "JSON event payload (inline)")
 	cmd.Flags().StringP("file", "f", "", "read the JSON event payload from a file ('-' for stdin)")
 
 	return cmd
-}
-
-func defaultHost() string {
-	if h := os.Getenv("MINI_LAMBDA_HOST"); h != "" {
-		return h
-	}
-	return "127.0.0.1:9000"
 }
 
 // readPayload resolves the event payload from --payload, then -f/--file (with
