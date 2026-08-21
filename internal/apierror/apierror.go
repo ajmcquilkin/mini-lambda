@@ -5,7 +5,10 @@ package apierror
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+
+	"github.com/ajmcquilkin/mini-lambda/internal/store"
 )
 
 // AWS error codes (the "__type" / X-Amzn-Errortype value).
@@ -34,11 +37,22 @@ type Error struct {
 	Status int `json:"-"`
 	// Reason is an optional throttle reason (e.g. for TooManyRequestsException).
 	Reason string `json:"Reason,omitempty"`
+
+	// cause is the underlying error this envelope was derived from, if any. It
+	// is exposed via Unwrap so errors.Is/As keep working through the mapping. It
+	// is never serialized to the wire.
+	cause error
 }
 
 // Error implements the error interface.
 func (e *Error) Error() string {
 	return e.Code + ": " + e.Message
+}
+
+// Unwrap returns the underlying cause, so errors.Is/As can see through an
+// envelope produced by FromError to the sentinel it was mapped from.
+func (e *Error) Unwrap() error {
+	return e.cause
 }
 
 // WriteHTTP writes the error as an AWS-style JSON response, setting the
@@ -81,4 +95,41 @@ func InvalidParameter(msg string) *Error {
 // Internal returns a 500 ServiceException.
 func Internal(msg string) *Error {
 	return &Error{Code: CodeService, Message: msg, Status: http.StatusInternalServerError}
+}
+
+// FromError maps an arbitrary error to its AWS-style envelope. It is the single
+// source of truth for the error->wire mapping shared by the public API and the
+// daemon:
+//
+//   - nil            -> nil
+//   - *apierror.Error -> itself (via errors.As; already-shaped errors pass through)
+//   - store.ErrNotFound -> NotFound (404 ResourceNotFoundException)
+//   - store.ErrConflict -> Conflict (409 ResourceConflictException)
+//   - anything else  -> Internal (500 ServiceException)
+//
+// For the sentinel and default cases the original error is carried as the
+// envelope's cause (see Unwrap), so errors.Is/As keep working through the
+// mapping. The rendered message preserves err.Error() to match prior behavior.
+func FromError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	var apiErr *Error
+	if errors.As(err, &apiErr) {
+		return apiErr
+	}
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return withCause(NotFound(err.Error()), err)
+	case errors.Is(err, store.ErrConflict):
+		return withCause(Conflict(err.Error()), err)
+	default:
+		return withCause(Internal(err.Error()), err)
+	}
+}
+
+// withCause attaches the originating error to an envelope so Unwrap exposes it.
+func withCause(e *Error, cause error) *Error {
+	e.cause = cause
+	return e
 }

@@ -1,8 +1,20 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "apierror",
     srcs = ["apierror.go"],
     importpath = "github.com/ajmcquilkin/mini-lambda/internal/apierror",
     visibility = ["//:__subpackages__"],
+    deps = ["//internal/store"],
+)
+
+go_test(
+    name = "apierror_test",
+    srcs = ["apierror_test.go"],
+    embed = [":apierror"],
+    deps = [
+        "//internal/store",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
 )

@@ -2,7 +2,6 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -181,17 +180,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // written verbatim; store sentinels map to their canonical codes; anything else
 // becomes a 500 ServiceException.
 func writeError(w http.ResponseWriter, err error) {
-	var apiErr *apierror.Error
-	switch {
-	case errors.As(err, &apiErr):
-		apiErr.WriteHTTP(w)
-	case errors.Is(err, store.ErrNotFound):
-		apierror.NotFound(err.Error()).WriteHTTP(w)
-	case errors.Is(err, store.ErrConflict):
-		apierror.Conflict(err.Error()).WriteHTTP(w)
-	default:
-		apierror.Internal(err.Error()).WriteHTTP(w)
-	}
+	apierror.FromError(err).WriteHTTP(w)
 }
 
 func orDefault(v, def int) int {

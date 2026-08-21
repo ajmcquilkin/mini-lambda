@@ -234,17 +234,10 @@ func openStore(ctx context.Context, dataDir string) (store.Store, error) {
 	return st, nil
 }
 
-// writeAPIError mirrors internal/api's error mapping for the logs endpoint.
+// writeAPIError mirrors internal/api's error mapping for the logs endpoint via
+// the shared apierror.FromError mapping.
 func writeAPIError(w http.ResponseWriter, err error) {
-	var apiErr *apierror.Error
-	switch {
-	case errors.As(err, &apiErr):
-		apiErr.WriteHTTP(w)
-	case errors.Is(err, store.ErrNotFound):
-		apierror.NotFound(err.Error()).WriteHTTP(w)
-	default:
-		apierror.Internal(err.Error()).WriteHTTP(w)
-	}
+	apierror.FromError(err).WriteHTTP(w)
 }
 
 // ignoreClosed treats http.ErrServerClosed as a clean shutdown.
