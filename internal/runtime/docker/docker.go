@@ -86,6 +86,7 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.ContainerSpec) (strin
 	}
 
 	hostConfig := &container.HostConfig{
+		ExtraHosts: spec.ExtraHosts,
 		Resources: container.Resources{
 			Memory: memoryBytes(spec.MemoryMB),
 		},

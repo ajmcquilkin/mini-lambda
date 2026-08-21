@@ -8,6 +8,8 @@ import (
 	"io"
 )
 
+//go:generate mockgen -destination=runtimemock/mock_runtime.go -package=runtimemock github.com/ajmcquilkin/mini-lambda/internal/runtime Runtime
+
 // ContainerSpec describes a container to create for a function invocation.
 type ContainerSpec struct {
 	// Image is the OCI image reference to run.
@@ -23,6 +25,12 @@ type ContainerSpec struct {
 	// single map lets the scheduler decide the exact variable set without widening
 	// this struct each time.
 	RuntimeAPIEnv map[string]string
+
+	// ExtraHosts adds "hostname:IP" entries to the container's /etc/hosts (the
+	// docker HostConfig.ExtraHosts field). The emulator uses this to inject
+	// "host.docker.internal:host-gateway" so the container can reach the
+	// daemon's Runtime API listener on the host.
+	ExtraHosts []string
 }
 
 // Runtime manages images and containers for function invocations.
