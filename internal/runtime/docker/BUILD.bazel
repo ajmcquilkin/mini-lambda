@@ -17,9 +17,15 @@ go_library(
 go_test(
     name = "docker_test",
     srcs = [
+        "docker_errors_test.go",
         "docker_integration_test.go",
         "docker_test.go",
     ],
     embed = [":docker"],
-    deps = ["//internal/runtime"],
+    deps = [
+        "//internal/runtime",
+        "@com_github_docker_docker//errdefs",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+    ],
 )
