@@ -1,0 +1,33 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "api",
+    srcs = [
+        "api.go",
+        "types.go",
+    ],
+    importpath = "github.com/ajmcquilkin/mini-lambda/internal/api",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/apierror",
+        "//internal/model",
+        "//internal/scheduler",
+        "//internal/store",
+    ],
+)
+
+go_test(
+    name = "api_test",
+    srcs = ["api_test.go"],
+    embed = [":api"],
+    deps = [
+        "//internal/apierror",
+        "//internal/model",
+        "//internal/scheduler/schedulermock",
+        "//internal/store",
+        "//internal/store/storemock",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
+        "@org_uber_go_mock//gomock",
+    ],
+)

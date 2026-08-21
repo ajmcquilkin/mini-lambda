@@ -19,6 +19,8 @@ var (
 	ErrConflict = errors.New("store: function already exists")
 )
 
+//go:generate mockgen -destination=storemock/mock_store.go -package=storemock github.com/ajmcquilkin/mini-lambda/internal/store Store
+
 // Store persists function configuration. Open and schema migration are the
 // responsibility of the implementation's constructor; Migrate is exposed so a
 // caller can (re-)run migrations explicitly.

@@ -10,6 +10,8 @@ import (
 	"github.com/ajmcquilkin/mini-lambda/internal/model"
 )
 
+//go:generate mockgen -destination=schedulermock/mock_scheduler.go -package=schedulermock github.com/ajmcquilkin/mini-lambda/internal/scheduler Scheduler
+
 // Scheduler executes function invocations under a bounded concurrency limit.
 type Scheduler interface {
 	// Invoke acquires a slot and runs fnName with payload, returning the result.

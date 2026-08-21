@@ -1,0 +1,12 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "storemock",
+    srcs = ["mock_store.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/internal/store/storemock",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/model",
+        "@org_uber_go_mock//gomock",
+    ],
+)
