@@ -94,10 +94,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
+// slotFor resolves the slot for the request's path token. On an unknown token
+// it writes the 403 Runtime.UnknownSlot envelope and returns ok=false, so
+// callers can simply `return` on a false result.
+func (s *Server) slotFor(w http.ResponseWriter, r *http.Request) (Slot, bool) {
 	slot, ok := s.reg.LookupSlot(r.PathValue("token"))
 	if !ok {
 		writeRuntimeError(w, http.StatusForbidden, "Runtime.UnknownSlot", "unknown runtime token")
+		return nil, false
+	}
+	return slot, true
+}
+
+func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
+	slot, ok := s.slotFor(w, r)
+	if !ok {
 		return
 	}
 
@@ -123,9 +134,8 @@ func (s *Server) handleNext(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleResponse(w http.ResponseWriter, r *http.Request) {
-	slot, ok := s.reg.LookupSlot(r.PathValue("token"))
+	slot, ok := s.slotFor(w, r)
 	if !ok {
-		writeRuntimeError(w, http.StatusForbidden, "Runtime.UnknownSlot", "unknown runtime token")
 		return
 	}
 	body := readBody(w, r)
@@ -140,9 +150,8 @@ func (s *Server) handleResponse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInvocationError(w http.ResponseWriter, r *http.Request) {
-	slot, ok := s.reg.LookupSlot(r.PathValue("token"))
+	slot, ok := s.slotFor(w, r)
 	if !ok {
-		writeRuntimeError(w, http.StatusForbidden, "Runtime.UnknownSlot", "unknown runtime token")
 		return
 	}
 	body := readBody(w, r)
@@ -157,9 +166,8 @@ func (s *Server) handleInvocationError(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleInitError(w http.ResponseWriter, r *http.Request) {
-	slot, ok := s.reg.LookupSlot(r.PathValue("token"))
+	slot, ok := s.slotFor(w, r)
 	if !ok {
-		writeRuntimeError(w, http.StatusForbidden, "Runtime.UnknownSlot", "unknown runtime token")
 		return
 	}
 	body := readBody(w, r)
