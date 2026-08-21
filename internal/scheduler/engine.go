@@ -406,14 +406,22 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 	<-e.reaperDone
 	e.touchWG.Wait()
 
+	// Tear slots down concurrently so per-container stop grace periods don't
+	// serialize into a total that blows the caller's shutdown budget.
+	var wg sync.WaitGroup
 	for _, s := range all {
 		s.close()
 		if s.containerID == "" {
 			continue
 		}
-		_ = e.rt.Stop(ctx, s.containerID)
-		_ = e.rt.Remove(ctx, s.containerID)
+		wg.Add(1)
+		go func(s *slot) {
+			defer wg.Done()
+			_ = e.rt.Stop(ctx, s.containerID)
+			_ = e.rt.Remove(ctx, s.containerID)
+		}(s)
 	}
+	wg.Wait()
 	return nil
 }
 
