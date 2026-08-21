@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -60,24 +61,20 @@ type Config struct {
 	timeoutFor func(fn *model.Function) time.Duration
 }
 
-// Engine is the concrete slot-based scheduler.Scheduler. It also implements
-// runtimeapi.Registry so the Runtime API listener can resolve a token to the
-// slot mailbox the RIC should talk to.
+// Engine is the concrete slot-based scheduler.Scheduler. It is the imperative
+// shell: it drives docker IO, timeouts, the reaper goroutine, and store
+// side-effects, delegating all slot state to an internal pool. It also
+// implements runtimeapi.Registry so the Runtime API listener can resolve a
+// token to the slot mailbox the RIC should talk to.
 type Engine struct {
 	store store.Store
 	rt    runtime.Runtime
 	cfg   Config
+	pool  *pool
 
 	now        func() time.Time
 	newToken   func() (string, error)
 	timeoutFor func(fn *model.Function) time.Duration
-
-	mu      sync.Mutex
-	closed  bool
-	byToken map[string]*slot
-	byFn    map[string]map[*slot]struct{} // all live slots (idle+busy) per function
-	idle    map[string][]*slot            // idle subset, used as a LIFO stack
-	total   int                           // total live slots across all functions
 
 	reaperStop chan struct{}
 	reaperDone chan struct{}
@@ -88,7 +85,7 @@ type Engine struct {
 }
 
 var (
-	_ Scheduler          = (*Engine)(nil)
+	_ Scheduler           = (*Engine)(nil)
 	_ runtimeapi.Registry = (*Engine)(nil)
 )
 
@@ -112,12 +109,10 @@ func New(st store.Store, rt runtime.Runtime, cfg Config) *Engine {
 		store:      st,
 		rt:         rt,
 		cfg:        cfg,
+		pool:       newPool(cfg.MaxConcurrency, cfg.PerFunctionConcurrency),
 		now:        cfg.now,
 		newToken:   cfg.newToken,
 		timeoutFor: cfg.timeoutFor,
-		byToken:    make(map[string]*slot),
-		byFn:       make(map[string]map[*slot]struct{}),
-		idle:       make(map[string][]*slot),
 		reaperStop: make(chan struct{}),
 		reaperDone: make(chan struct{}),
 	}
@@ -202,51 +197,36 @@ func (e *Engine) finish(s *slot, fn *model.Function, o outcome) *model.InvokeRes
 	}
 }
 
-// acquire returns a warm idle slot for fn if one exists, otherwise cold-starts a
-// new slot subject to the per-function and daemon-wide caps. Over capacity it
-// returns an *apierror.Error throttle.
+// acquire returns a warm idle slot from the pool, or reserves a new one and
+// cold-starts its container. Pool errors are mapped to the API wire vocabulary.
 func (e *Engine) acquire(ctx context.Context, fn *model.Function) (*slot, error) {
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		return nil, apierror.Internal("scheduler is shutting down")
+	s, warm, err := e.pool.acquire(fn.Name, e.newToken)
+	if err != nil {
+		return nil, mapAcquireError(fn.Name, err)
 	}
-
-	if stack := e.idle[fn.Name]; len(stack) > 0 {
-		s := stack[len(stack)-1]
-		e.idle[fn.Name] = stack[:len(stack)-1]
-		e.mu.Unlock()
+	if warm {
 		return s, nil
 	}
-
-	if e.total >= e.cfg.MaxConcurrency {
-		e.mu.Unlock()
-		return nil, apierror.Throttled("daemon-wide max concurrency reached")
-	}
-	if len(e.byFn[fn.Name]) >= e.cfg.PerFunctionConcurrency {
-		e.mu.Unlock()
-		return nil, apierror.Throttled("function concurrency limit reached for " + fn.Name)
-	}
-
-	token, err := e.newToken()
-	if err != nil {
-		e.mu.Unlock()
-		return nil, apierror.Internal("allocate slot token: " + err.Error())
-	}
-	s := newSlot(token, fn.Name)
-	e.byToken[token] = s
-	if e.byFn[fn.Name] == nil {
-		e.byFn[fn.Name] = make(map[*slot]struct{})
-	}
-	e.byFn[fn.Name][s] = struct{}{}
-	e.total++
-	e.mu.Unlock()
-
 	if err := e.coldStart(ctx, fn, s); err != nil {
 		e.destroy(s)
 		return nil, apierror.Internal("cold start " + fn.Name + ": " + err.Error())
 	}
 	return s, nil
+}
+
+// mapAcquireError translates a pool sentinel into the public API error. The pool
+// stays free of HTTP semantics; this is the shell's job.
+func mapAcquireError(fnName string, err error) error {
+	switch {
+	case errors.Is(err, errPoolClosed):
+		return apierror.Internal("scheduler is shutting down")
+	case errors.Is(err, errGlobalCap):
+		return apierror.Throttled("daemon-wide max concurrency reached")
+	case errors.Is(err, errFunctionCap):
+		return apierror.Throttled("function concurrency limit reached for " + fnName)
+	default:
+		return apierror.Internal("allocate slot for " + fnName + ": " + err.Error())
+	}
 }
 
 // coldStart pulls the image, creates the container with the function env plus
@@ -279,40 +259,18 @@ func (e *Engine) coldStart(ctx context.Context, fn *model.Function, s *slot) err
 	return nil
 }
 
-// release returns a slot to its function's idle pool and stamps lastUsed. If the
-// engine is shutting down or the slot was already destroyed, it is dropped.
+// release returns a slot to the idle pool, stamped with the current time.
 func (e *Engine) release(s *slot) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.closed {
-		return
-	}
-	if _, live := e.byToken[s.token]; !live {
-		return
-	}
-	s.lastUsed = e.now()
-	e.idle[s.fnName] = append(e.idle[s.fnName], s)
+	e.pool.markIdle(s, e.now())
 }
 
-// destroy removes a slot from all bookkeeping, unblocks its poll, and stops+
-// removes its container. It is idempotent.
+// destroy removes a slot from the pool, unblocks its poll, and stops+removes its
+// container. It is idempotent: only the caller that actually removed the slot
+// tears the container down.
 func (e *Engine) destroy(s *slot) {
-	e.mu.Lock()
-	if _, live := e.byToken[s.token]; !live {
-		e.mu.Unlock()
+	if !e.pool.remove(s) {
 		return
 	}
-	delete(e.byToken, s.token)
-	if set := e.byFn[s.fnName]; set != nil {
-		delete(set, s)
-		if len(set) == 0 {
-			delete(e.byFn, s.fnName)
-		}
-	}
-	e.removeIdleLocked(s)
-	e.total--
-	e.mu.Unlock()
-
 	s.close()
 	e.stopContainer(s)
 }
@@ -326,17 +284,6 @@ func (e *Engine) stopContainer(s *slot) {
 	defer cancel()
 	_ = e.rt.Stop(ctx, s.containerID)
 	_ = e.rt.Remove(ctx, s.containerID)
-}
-
-// removeIdleLocked drops s from its function's idle stack. Caller holds e.mu.
-func (e *Engine) removeIdleLocked(s *slot) {
-	stack := e.idle[s.fnName]
-	for i, cand := range stack {
-		if cand == s {
-			e.idle[s.fnName] = append(stack[:i], stack[i+1:]...)
-			return
-		}
-	}
 }
 
 // touchLastInvoked best-effort stamps the function's last_invoked_at. It runs
@@ -360,49 +307,27 @@ func (e *Engine) touchLastInvoked(name string) {
 // FunctionContainerIDs returns the container IDs of the live slots (idle+busy)
 // for name, in no particular order. Used by the daemon's log endpoint.
 func (e *Engine) FunctionContainerIDs(name string) []string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	set := e.byFn[name]
-	ids := make([]string, 0, len(set))
-	for s := range set {
-		if s.containerID != "" {
-			ids = append(ids, s.containerID)
-		}
-	}
-	return ids
+	return e.pool.containerIDs(name)
 }
 
 // LookupSlot resolves a token to its slot mailbox for the Runtime API.
 func (e *Engine) LookupSlot(token string) (runtimeapi.Slot, bool) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	s, ok := e.byToken[token]
+	s, ok := e.pool.lookup(token)
 	if !ok {
 		return nil, false
 	}
 	return s, true
 }
 
-// Shutdown stops the reaper and destroys every managed container.
+// Shutdown stops the reaper and destroys every managed container. It is safe to
+// call more than once; only the first call does work.
 func (e *Engine) Shutdown(ctx context.Context) error {
-	e.mu.Lock()
-	if e.closed {
-		e.mu.Unlock()
-		return nil
+	all := e.pool.drain()
+	if all == nil {
+		return nil // already shut down
 	}
-	e.closed = true
+
 	close(e.reaperStop)
-
-	all := make([]*slot, 0, len(e.byToken))
-	for _, s := range e.byToken {
-		all = append(all, s)
-	}
-	e.byToken = make(map[string]*slot)
-	e.byFn = make(map[string]map[*slot]struct{})
-	e.idle = make(map[string][]*slot)
-	e.total = 0
-	e.mu.Unlock()
-
 	<-e.reaperDone
 	e.touchWG.Wait()
 
@@ -435,46 +360,11 @@ func (e *Engine) reapLoop() {
 		case <-e.reaperStop:
 			return
 		case <-ticker.C:
-			e.reapIdle()
-		}
-	}
-}
-
-// reapIdle destroys idle slots older than IdleTTL.
-func (e *Engine) reapIdle() {
-	now := e.now()
-	e.mu.Lock()
-	var expired []*slot
-	for fn, stack := range e.idle {
-		kept := stack[:0]
-		for _, s := range stack {
-			if now.Sub(s.lastUsed) >= e.cfg.IdleTTL {
-				expired = append(expired, s)
-			} else {
-				kept = append(kept, s)
+			for _, s := range e.pool.expired(e.now(), e.cfg.IdleTTL) {
+				s.close()
+				e.stopContainer(s)
 			}
 		}
-		if len(kept) == 0 {
-			delete(e.idle, fn)
-		} else {
-			e.idle[fn] = kept
-		}
-	}
-	for _, s := range expired {
-		delete(e.byToken, s.token)
-		if set := e.byFn[s.fnName]; set != nil {
-			delete(set, s)
-			if len(set) == 0 {
-				delete(e.byFn, s.fnName)
-			}
-		}
-		e.total--
-	}
-	e.mu.Unlock()
-
-	for _, s := range expired {
-		s.close()
-		e.stopContainer(s)
 	}
 }
 
