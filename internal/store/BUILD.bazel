@@ -1,9 +1,30 @@
-load("@rules_go//go:def.bzl", "go_library")
+load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "store",
-    srcs = ["store.go"],
+    srcs = [
+        "sqlite.go",
+        "store.go",
+    ],
+    embedsrcs = [
+        "migrations/0001_init.down.sql",
+        "migrations/0001_init.up.sql",
+    ],
     importpath = "github.com/ajmcquilkin/mini-lambda/internal/store",
     visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/model",
+        "@com_github_golang_migrate_migrate_v4//:migrate",
+        "@com_github_golang_migrate_migrate_v4//database/sqlite",
+        "@com_github_golang_migrate_migrate_v4//source/iofs",
+        "@org_modernc_sqlite//:sqlite",
+        "@org_modernc_sqlite//lib",
+    ],
+)
+
+go_test(
+    name = "store_test",
+    srcs = ["sqlite_test.go"],
+    embed = [":store"],
     deps = ["//internal/model"],
 )
