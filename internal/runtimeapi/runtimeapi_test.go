@@ -125,6 +125,31 @@ func TestUnknownTokenForbidden(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, rec.Code)
 }
 
+// TestUnknownTokenForbiddenAllRoutes asserts every runtime-API route funnels an
+// unknown token through the shared slotFor prologue: identical 403 status,
+// error envelope, and Content-Type.
+func TestUnknownTokenForbiddenAllRoutes(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"next", http.MethodGet, "/nope/2018-06-01/runtime/invocation/next", ""},
+		{"response", http.MethodPost, "/nope/2018-06-01/runtime/invocation/req-1/response", `{}`},
+		{"invocationError", http.MethodPost, "/nope/2018-06-01/runtime/invocation/req-1/error", `{}`},
+		{"initError", http.MethodPost, "/nope/2018-06-01/runtime/init/error", `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := serve(t, fakeRegistry{}, tc.method, tc.path, tc.body)
+			require.Equal(t, http.StatusForbidden, rec.Code)
+			assert.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+			assert.JSONEq(t, `{"errorMessage":"unknown runtime token","errorType":"Runtime.UnknownSlot"}`, rec.Body.String())
+		})
+	}
+}
+
 func TestBadRequestIDRejected(t *testing.T) {
 	slot := &fakeSlot{failReq: true}
 	rec := serve(t, fakeRegistry{token: slot}, http.MethodPost, "/"+token+"/2018-06-01/runtime/invocation/wrong/response", `{}`)
