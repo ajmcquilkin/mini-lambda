@@ -24,6 +24,8 @@ go_test(
     srcs = [
         "engine_test.go",
         "export_test.go",
+        "pool_test.go",
+        "slot_test.go",
     ],
     embed = [":scheduler"],
     deps = [
