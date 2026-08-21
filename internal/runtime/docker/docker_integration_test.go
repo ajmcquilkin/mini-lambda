@@ -36,7 +36,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	defer cancel()
 
 	if err := rt.Pull(ctx, testImage); err != nil {
@@ -64,7 +64,7 @@ func TestIntegrationLifecycle(t *testing.T) {
 	t.Logf("created container %s", id)
 
 	defer func() {
-		if err := rt.Remove(context.Background(), id); err != nil {
+		if err := rt.Remove(t.Context(), id); err != nil {
 			t.Errorf("Remove: %v", err)
 		}
 	}()
@@ -100,7 +100,7 @@ func TestIntegrationNotFoundMapping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 
 	const missing = "mini-lambda-nonexistent-container-id"
