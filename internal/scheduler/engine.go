@@ -146,7 +146,7 @@ func (e *Engine) Invoke(ctx context.Context, fnName string, payload []byte) (*mo
 		return nil, err
 	}
 
-	ic := model.NewInvocationContext(fn)
+	ic := model.NewInvocationContextAt(e.now(), fn)
 	p := &pending{
 		inv: &runtimeapi.Invocation{
 			RequestID:          ic.RequestID,
@@ -178,23 +178,45 @@ func (e *Engine) Invoke(ctx context.Context, fnName string, payload []byte) (*mo
 	}
 }
 
-// finish maps a terminal outcome to an InvokeResult and either returns the slot
-// to the idle pool (success/handler-error keep the sandbox warm) or destroys it
-// (init failure).
-func (e *Engine) finish(s *slot, fn *model.Function, o outcome) *model.InvokeResult {
+// disposition is what finish must do with a slot after an invocation: keep it
+// warm in the idle pool, or tear it down.
+type disposition int
+
+const (
+	// dispositionRelease returns the slot to the idle pool (the sandbox stays
+	// warm) and stamps last_invoked_at.
+	dispositionRelease disposition = iota
+	// dispositionDestroy tears the slot down; the next invocation cold-starts.
+	dispositionDestroy
+)
+
+// classify is the pure outcome->result decision: which InvokeResult to return
+// and whether the slot is kept warm or destroyed. It has no pool/docker/store
+// effects, so the whole mapping is table-testable without the mock harness.
+func classify(o outcome) (disposition, *model.InvokeResult) {
 	switch o.kind {
 	case outcomeResponse:
-		e.release(s)
-		e.touchLastInvoked(fn.Name)
-		return &model.InvokeResult{Payload: o.payload, StatusCode: 200}
+		return dispositionRelease, &model.InvokeResult{Payload: o.payload, StatusCode: 200}
 	case outcomeError:
+		return dispositionRelease, &model.InvokeResult{Payload: o.payload, FunctionError: "Unhandled", StatusCode: 200}
+	default: // outcomeInitError
+		return dispositionDestroy, &model.InvokeResult{Payload: o.payload, FunctionError: "Unhandled", StatusCode: 200}
+	}
+}
+
+// finish classifies a terminal outcome, then applies the effects for its
+// disposition: release the slot to the idle pool (success/handler-error keep the
+// sandbox warm) and stamp last_invoked_at, or destroy it (init failure).
+func (e *Engine) finish(s *slot, fn *model.Function, o outcome) *model.InvokeResult {
+	d, res := classify(o)
+	switch d {
+	case dispositionRelease:
 		e.release(s)
 		e.touchLastInvoked(fn.Name)
-		return &model.InvokeResult{Payload: o.payload, FunctionError: "Unhandled", StatusCode: 200}
-	default: // outcomeInitError
+	default: // dispositionDestroy
 		e.destroy(s)
-		return &model.InvokeResult{Payload: o.payload, FunctionError: "Unhandled", StatusCode: 200}
 	}
+	return res
 }
 
 // acquire returns a warm idle slot from the pool, or reserves a new one and
@@ -360,11 +382,18 @@ func (e *Engine) reapLoop() {
 		case <-e.reaperStop:
 			return
 		case <-ticker.C:
-			for _, s := range e.pool.expired(e.now(), e.cfg.IdleTTL) {
-				s.close()
-				e.stopContainer(s)
-			}
+			e.reapOnce(e.now())
 		}
+	}
+}
+
+// reapOnce is one reaper tick: it destroys every idle slot whose lastUsed has
+// exceeded IdleTTL as of now. Split out of the ticker loop so a single
+// deterministic test covers expiry->destroy without waiting on real time.
+func (e *Engine) reapOnce(now time.Time) {
+	for _, s := range e.pool.expired(now, e.cfg.IdleTTL) {
+		s.close()
+		e.stopContainer(s)
 	}
 }
 

@@ -344,6 +344,104 @@ func TestColdStartCreateFailure(t *testing.T) {
 	assert.Equal(t, 0, eng.liveSlots())
 }
 
+func TestClassify(t *testing.T) {
+	tests := []struct {
+		name        string
+		o           outcome
+		wantDisp    disposition
+		wantPayload string
+		wantErr     string
+	}{
+		{"response keeps slot warm", outcome{kind: outcomeResponse, payload: []byte(`{"ok":true}`)}, dispositionRelease, `{"ok":true}`, ""},
+		{"handler error keeps slot warm", outcome{kind: outcomeError, payload: []byte(`{"errorMessage":"boom"}`)}, dispositionRelease, `{"errorMessage":"boom"}`, "Unhandled"},
+		{"init error destroys slot", outcome{kind: outcomeInitError, payload: []byte(`{"errorMessage":"cannot init"}`)}, dispositionDestroy, `{"errorMessage":"cannot init"}`, "Unhandled"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			disp, res := classify(tt.o)
+			assert.Equal(t, tt.wantDisp, disp)
+			require.NotNil(t, res)
+			assert.Equal(t, 200, res.StatusCode)
+			assert.Equal(t, tt.wantErr, res.FunctionError)
+			assert.Equal(t, tt.wantPayload, string(res.Payload))
+		})
+	}
+}
+
+func TestTimeoutResult(t *testing.T) {
+	inv := &runtimeapi.Invocation{RequestID: "req-1"}
+	res := timeoutResult(inv, 3*time.Second)
+
+	assert.Equal(t, 200, res.StatusCode)
+	assert.Equal(t, "Unhandled", res.FunctionError)
+	assert.Contains(t, string(res.Payload), "req-1 Task timed out after 3.00 seconds")
+	assert.Contains(t, string(res.Payload), `"errorType":"Sandbox.Timedout"`)
+}
+
+func TestMapAcquireError(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		wantStatus  int
+		wantCode    string
+		msgContains string
+	}{
+		{"pool closed maps to internal", errPoolClosed, 500, apierror.CodeService, "shutting down"},
+		{"global cap maps to throttle", errGlobalCap, 429, apierror.CodeTooManyRequests, "daemon-wide"},
+		{"function cap maps to throttle", errFunctionCap, 429, apierror.CodeTooManyRequests, "hello"},
+		{"unknown error maps to internal", errBoom, 500, apierror.CodeService, "allocate slot for hello"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mapAcquireError("hello", tt.err)
+			var apiErr *apierror.Error
+			require.ErrorAs(t, err, &apiErr)
+			assert.Equal(t, tt.wantStatus, apiErr.Status)
+			assert.Equal(t, tt.wantCode, apiErr.Code)
+			assert.Contains(t, apiErr.Message, tt.msgContains)
+		})
+	}
+}
+
+func TestReapIntervalFor(t *testing.T) {
+	tests := []struct {
+		name string
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{"tiny ttl floors at one second", time.Second, time.Second},
+		{"quarter-ttl boundary at floor", 4 * time.Second, time.Second},
+		{"quarter of ttl in the mid range", 40 * time.Second, 10 * time.Second},
+		{"quarter-ttl boundary at cap", 4 * time.Minute, time.Minute},
+		{"large ttl caps at one minute", 10 * time.Minute, time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, reapIntervalFor(tt.ttl))
+		})
+	}
+}
+
+func TestReapOnceDestroysExpiredIdleSlots(t *testing.T) {
+	base := time.Unix(1000, 0)
+	cfg := Config{IdleTTL: time.Minute, now: func() time.Time { return base }}
+	h := newHarness(t, testFunction(), cfg)
+	h.setBehavior(respondEcho)
+	h.expectStopRemove() // the warm idle slot is destroyed once, by reapOnce
+
+	_, err := h.eng.Invoke(t.Context(), "hello", []byte(`{}`))
+	require.NoError(t, err)
+	require.Equal(t, 1, h.eng.liveSlots()) // slot released to the idle pool
+
+	// A tick within the TTL leaves the idle slot alone.
+	h.eng.reapOnce(base.Add(30 * time.Second))
+	assert.Equal(t, 1, h.eng.liveSlots())
+
+	// A tick past the TTL destroys it deterministically, no real waiting.
+	h.eng.reapOnce(base.Add(2 * time.Minute))
+	assert.Equal(t, 0, h.eng.liveSlots())
+}
+
 var (
 	errNotFound = errors.New("store: function not found")
 	errBoom     = errors.New("boom")
