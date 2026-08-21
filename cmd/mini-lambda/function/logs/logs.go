@@ -11,7 +11,7 @@ func NewCmd() *cobra.Command {
 		Short: "Show logs for a function",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.Println("function logs: not implemented")
+			cmd.Println("function logs: not implemented until the daemon lands")
 			return nil
 		},
 	}
