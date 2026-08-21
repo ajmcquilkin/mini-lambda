@@ -4,8 +4,11 @@
 # Bazel disk cache / user config
 .bazelrc.user
 
+# Hermit-managed toolchain lives in /bin (stubs + .hcl are committed).
+# Ignore only Hermit's local env state/cache, never the checked-in stubs.
+/bin/.hermit/
+
 # Go build & test artifacts
-/bin/
 *.test
 *.out
 *.exe
