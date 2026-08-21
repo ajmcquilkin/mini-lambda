@@ -53,6 +53,38 @@ func TestNewInvocationContextZeroTimeout(t *testing.T) {
 	assert.LessOrEqual(t, ctx.DeadlineMs, after.UnixMilli())
 }
 
+func TestDeadlineMs(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	tests := []struct {
+		name       string
+		timeoutSec int
+		want       int64
+	}{
+		{"zero timeout deadlines now", 0, base.UnixMilli()},
+		{"positive timeout adds whole seconds", 3, base.Add(3 * time.Second).UnixMilli()},
+		{"large timeout", 900, base.Add(900 * time.Second).UnixMilli()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, DeadlineMs(base, tt.timeoutSec))
+		})
+	}
+}
+
+func TestNewInvocationContextAtDeadlineIsExact(t *testing.T) {
+	base := time.Unix(1_700_000_000, 0)
+	fn := &Function{Name: "hello", TimeoutSec: 30}
+
+	ctx := NewInvocationContextAt(base, fn)
+
+	// With an injected clock the deadline is exact: no tolerance window.
+	assert.Equal(t, base.Add(30*time.Second).UnixMilli(), ctx.DeadlineMs)
+	assert.Equal(t, FunctionARN("hello"), ctx.InvokedFunctionArn)
+	assert.Empty(t, ctx.TraceID)
+	_, err := uuid.Parse(ctx.RequestID)
+	require.NoError(t, err)
+}
+
 func TestNewInvocationContextRequestIDIsUniqueUUID(t *testing.T) {
 	fn := &Function{Name: "hello", TimeoutSec: 3}
 

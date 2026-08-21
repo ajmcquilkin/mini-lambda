@@ -56,14 +56,27 @@ func FunctionARN(name string) string {
 	return fmt.Sprintf("arn:aws:lambda:local:000000000000:function:%s", name)
 }
 
-// NewInvocationContext fabricates an InvocationContext for a single invocation
-// of fn, filling RequestID, DeadlineMs, and InvokedFunctionArn. TraceID is left
-// empty.
-func NewInvocationContext(fn *Function) InvocationContext {
-	deadline := time.Now().Add(time.Duration(fn.TimeoutSec) * time.Second)
+// DeadlineMs computes an invocation deadline (now + timeoutSec) as epoch
+// milliseconds. It is pure so the deadline math can be tested exactly against an
+// injected clock rather than a real time.Now() tolerance window.
+func DeadlineMs(now time.Time, timeoutSec int) int64 {
+	return now.Add(time.Duration(timeoutSec) * time.Second).UnixMilli()
+}
+
+// NewInvocationContextAt fabricates an InvocationContext for a single invocation
+// of fn using the supplied clock, filling RequestID, DeadlineMs, and
+// InvokedFunctionArn. TraceID is left empty. Callers with an injectable clock
+// (e.g. the scheduler Engine) use this so the deadline honors that clock.
+func NewInvocationContextAt(now time.Time, fn *Function) InvocationContext {
 	return InvocationContext{
 		RequestID:          uuid.NewString(),
-		DeadlineMs:         deadline.UnixMilli(),
+		DeadlineMs:         DeadlineMs(now, fn.TimeoutSec),
 		InvokedFunctionArn: FunctionARN(fn.Name),
 	}
+}
+
+// NewInvocationContext is a thin wrapper over NewInvocationContextAt using the
+// wall clock, for callers without their own clock.
+func NewInvocationContext(fn *Function) InvocationContext {
+	return NewInvocationContextAt(time.Now(), fn)
 }
