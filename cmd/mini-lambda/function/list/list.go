@@ -3,12 +3,12 @@ package list
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/ajmcquilkin/mini-lambda/cmd/mini-lambda/internal/cli"
 	"github.com/ajmcquilkin/mini-lambda/internal/api"
 	"github.com/ajmcquilkin/mini-lambda/internal/client"
 )
@@ -21,7 +21,7 @@ func NewCmd() *cobra.Command {
 		Short:   "List functions",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			host, _ := cmd.Flags().GetString("host")
+			host := cli.ResolveHost(cmd)
 			output, _ := cmd.Flags().GetString("output")
 
 			fns, err := client.New(host).ListFunctions()
@@ -49,15 +49,8 @@ func NewCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().String("host", defaultHost(), "mini-lambda daemon address (env MINI_LAMBDA_HOST)")
+	cli.AddHostFlag(cmd)
 	cmd.Flags().String("output", "table", "output format (table|json)")
 
 	return cmd
-}
-
-func defaultHost() string {
-	if h := os.Getenv("MINI_LAMBDA_HOST"); h != "" {
-		return h
-	}
-	return "127.0.0.1:9000"
 }
