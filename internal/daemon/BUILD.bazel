@@ -1,0 +1,17 @@
+load("@rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "daemon",
+    srcs = ["daemon.go"],
+    importpath = "github.com/ajmcquilkin/mini-lambda/internal/daemon",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/api",
+        "//internal/apierror",
+        "//internal/runtime",
+        "//internal/runtime/docker",
+        "//internal/runtimeapi",
+        "//internal/scheduler",
+        "//internal/store",
+    ],
+)
