@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/ajmcquilkin/mini-lambda/internal/api"
 	"github.com/ajmcquilkin/mini-lambda/internal/apierror"
+	"github.com/ajmcquilkin/mini-lambda/internal/model"
 	"github.com/ajmcquilkin/mini-lambda/internal/runtime"
 	"github.com/ajmcquilkin/mini-lambda/internal/runtime/docker"
 	"github.com/ajmcquilkin/mini-lambda/internal/runtimeapi"
@@ -93,11 +95,10 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("daemon: listen runtime api %q: %w", cfg.RuntimeAddr, err)
 	}
-	runtimePort := runtimeLn.Addr().(*net.TCPAddr).Port
-	reachableHost := fmt.Sprintf("%s:%d", cfg.ReachableHostname, runtimePort)
+	reachable := reachableHost(cfg.ReachableHostname, listenerPort(runtimeLn.Addr()))
 
 	sched := scheduler.New(st, rt, scheduler.Config{
-		ReachableHost:          reachableHost,
+		ReachableHost:          reachable,
 		ExtraHosts:             []string{hostGatewayExtraHost},
 		MaxConcurrency:         cfg.MaxConcurrency,
 		PerFunctionConcurrency: cfg.PerFunctionConcurrency,
@@ -148,30 +149,57 @@ func (d *daemon) shutdown(runtimeSrv, apiSrv *http.Server) {
 	_ = runtimeSrv.Shutdown(sctx)
 }
 
+// functionExister confirms a function exists before its logs are streamed. It
+// is the sole store method the logs endpoint needs; satisfied by store.Store.
+type functionExister interface {
+	GetFunction(ctx context.Context, name string) (*model.Function, error)
+}
+
+// containerLister reports the live container IDs backing a function's slots.
+// Satisfied by *scheduler.Engine.
+type containerLister interface {
+	FunctionContainerIDs(fn string) []string
+}
+
+// logStreamer opens a container's log stream. Satisfied by runtime.Runtime.
+type logStreamer interface {
+	Logs(ctx context.Context, id string, follow bool) (io.ReadCloser, error)
+}
+
+// logsHandler serves the live-logs endpoint. Its dependencies are the minimal
+// consumer-side interfaces the handler actually uses, so it is exercised with
+// httptest and small in-package fakes without standing up the whole daemon.
+type logsHandler struct {
+	fns        functionExister
+	containers containerLister
+	logs       logStreamer
+}
+
 // publicHandler builds the public API handler plus the live-logs endpoint.
 func (d *daemon) publicHandler() http.Handler {
 	mux := http.NewServeMux()
 	// The AWS-shaped API owns everything under "/"; the more specific method+path
 	// pattern for logs takes precedence in Go's ServeMux.
 	mux.Handle("/", api.New(d.store, d.sched))
-	mux.HandleFunc("GET /mini-lambda/functions/{name}/logs", d.handleLogs)
+	lh := &logsHandler{fns: d.store, containers: d.sched, logs: d.rt}
+	mux.HandleFunc("GET /mini-lambda/functions/{name}/logs", lh.handle)
 	return mux
 }
 
-// handleLogs streams combined logs from a function's live slot containers.
-// Logs are live-only: when a slot dies its logs are gone. With follow=false it
+// handle streams combined logs from a function's live slot containers. Logs are
+// live-only: when a slot dies its logs are gone. With follow=false it
 // concatenates each live container's current logs; with follow=true it streams
 // the first live container (a deliberate minimal choice — multiplexing multiple
 // follow streams is out of scope for this round).
-func (d *daemon) handleLogs(w http.ResponseWriter, r *http.Request) {
+func (h *logsHandler) handle(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	if _, err := d.store.GetFunction(r.Context(), name); err != nil {
+	if _, err := h.fns.GetFunction(r.Context(), name); err != nil {
 		writeAPIError(w, err)
 		return
 	}
 
-	follow := isTrue(r.URL.Query().Get("follow"))
-	ids := d.sched.FunctionContainerIDs(name)
+	follow := parseFollow(r.URL.Query().Get("follow"))
+	ids := h.containers.FunctionContainerIDs(name)
 
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -181,17 +209,17 @@ func (d *daemon) handleLogs(w http.ResponseWriter, r *http.Request) {
 
 	flusher, _ := w.(http.Flusher)
 	if follow {
-		d.streamLogs(r.Context(), w, flusher, ids[0], true)
+		h.stream(r.Context(), w, flusher, ids[0], true)
 		return
 	}
 	for _, id := range ids {
-		d.streamLogs(r.Context(), w, flusher, id, false)
+		h.stream(r.Context(), w, flusher, id, false)
 	}
 }
 
-// streamLogs copies one container's logs to w, flushing as it goes.
-func (d *daemon) streamLogs(ctx context.Context, w io.Writer, flusher http.Flusher, id string, follow bool) {
-	rc, err := d.rt.Logs(ctx, id, follow)
+// stream copies one container's logs to w, flushing as it goes.
+func (h *logsHandler) stream(ctx context.Context, w io.Writer, flusher http.Flusher, id string, follow bool) {
+	rc, err := h.logs.Logs(ctx, id, follow)
 	if err != nil {
 		fmt.Fprintf(w, "mini-lambda: logs for %s unavailable: %v\n", id, err)
 		return
@@ -234,6 +262,22 @@ func openStore(ctx context.Context, dataDir string) (store.Store, error) {
 	return st, nil
 }
 
+// reachableHost builds the "host:port" a container uses to reach the daemon's
+// Runtime API listener (the AWS_LAMBDA_RUNTIME_API value the scheduler bakes
+// into each container's env).
+func reachableHost(hostname string, port int) string {
+	return fmt.Sprintf("%s:%d", hostname, port)
+}
+
+// listenerPort extracts the TCP port a listener bound to. It returns 0 for a
+// non-TCP address, which the daemon's tcp listeners never produce.
+func listenerPort(addr net.Addr) int {
+	if tcp, ok := addr.(*net.TCPAddr); ok {
+		return tcp.Port
+	}
+	return 0
+}
+
 // writeAPIError mirrors internal/api's error mapping for the logs endpoint via
 // the shared apierror.FromError mapping.
 func writeAPIError(w http.ResponseWriter, err error) {
@@ -248,11 +292,11 @@ func ignoreClosed(err error) error {
 	return err
 }
 
-func isTrue(v string) bool {
-	switch v {
-	case "1", "true", "TRUE", "True", "yes":
-		return true
-	default:
-		return false
-	}
+// parseFollow interprets the logs endpoint's ?follow query param with
+// strconv.ParseBool semantics; empty or unparseable values are treated as
+// false. This replaces a hand-rolled check: "1"/"t"/"T"/"true"/"True"/"TRUE"
+// (and their false counterparts) are recognized, but "yes" is no longer truthy.
+func parseFollow(v string) bool {
+	b, err := strconv.ParseBool(v)
+	return err == nil && b
 }
