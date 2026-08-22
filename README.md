@@ -114,6 +114,15 @@ Separately, the daemon serves the Lambda Runtime API (`2018-06-01`) to the funct
 
 This repo carries its own toolchain via [Hermit](https://cashapp.github.io/hermit/). The stubs in `bin/` are committed, so a **fresh clone needs zero preinstalled tools** — no hand-installing bazelisk/bazel/go on each CI or agent VM.
 
+Install (or update) the `mini-lambda` binary onto your machine — builds with the repo toolchain and copies it into place:
+
+```sh
+./scripts/install.sh                                   # installs to $HOME/.local/bin
+MINI_LAMBDA_INSTALL_DIR=/usr/local/bin ./scripts/install.sh   # or override the destination (also accepts a first-arg path)
+```
+
+Re-running updates the installed binary in place.
+
 ```sh
 # Option A: run tools directly through the committed stubs
 bin/bazel build //...
