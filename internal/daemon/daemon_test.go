@@ -80,6 +80,19 @@ func TestListenerPort(t *testing.T) {
 	}
 }
 
+func TestStartupLine(t *testing.T) {
+	reachable := reachableHost("host.docker.internal", 9001)
+	runtimeAddr := &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 9001}
+
+	got := startupLine("127.0.0.1:9000", runtimeAddr, reachable)
+
+	// The resolved host string must appear verbatim; the old bug logged the
+	// reachableHost function value ("%!s(func...)") instead.
+	assert.Contains(t, got, reachable)
+	assert.NotContains(t, got, "%!")
+	assert.Equal(t, "mini-lambda daemon listening: api=127.0.0.1:9000 runtime-api=0.0.0.0:9001 (reachable as host.docker.internal:9001)", got)
+}
+
 // fakeFns is a hand-rolled functionExister: it reports whether a function
 // exists via the error it returns from GetFunction.
 type fakeFns struct {

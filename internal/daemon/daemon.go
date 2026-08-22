@@ -120,7 +120,7 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { serveErr <- ignoreClosed(runtimeSrv.Serve(runtimeLn)) }()
 	go func() { serveErr <- ignoreClosed(apiSrv.Serve(apiLn)) }()
 
-	cfg.logf("mini-lambda daemon listening: api=%s runtime-api=%s (reachable as %s)", cfg.Addr, runtimeLn.Addr(), reachableHost)
+	cfg.logf("%s", startupLine(cfg.Addr, runtimeLn.Addr(), reachable))
 
 	select {
 	case <-ctx.Done():
@@ -267,6 +267,12 @@ func openStore(ctx context.Context, dataDir string) (store.Store, error) {
 // into each container's env).
 func reachableHost(hostname string, port int) string {
 	return fmt.Sprintf("%s:%d", hostname, port)
+}
+
+// startupLine renders the daemon's "listening" log line. reachable is the
+// already-resolved "host:port" string (from reachableHost), not the function.
+func startupLine(apiAddr string, runtimeAddr net.Addr, reachable string) string {
+	return fmt.Sprintf("mini-lambda daemon listening: api=%s runtime-api=%s (reachable as %s)", apiAddr, runtimeAddr, reachable)
 }
 
 // listenerPort extracts the TCP port a listener bound to. It returns 0 for a
