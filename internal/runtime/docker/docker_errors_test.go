@@ -19,7 +19,6 @@ func TestWrapDockerErr(t *testing.T) {
 	connFailed := client.ErrorConnectionFailed("unix:///var/run/docker.sock")
 
 	host := "unix:///Users/dev/.docker/run/docker.sock"
-	tried := []string{"DOCKER_HOST unset", "/var/run/docker.sock", "/Users/dev/.docker/run/docker.sock"}
 
 	tests := []struct {
 		name             string
@@ -39,7 +38,7 @@ func TestWrapDockerErr(t *testing.T) {
 			wantMsgSubstrs: []string{`docker: start container "abc123"`},
 		},
 		{
-			name:         "maps connection failure to ErrDockerUnavailable with host, probes and hint",
+			name:         "maps connection failure to ErrDockerUnavailable with host and hint",
 			op:           `inspect image "echo-python:latest"`,
 			in:           connFailed,
 			wantErrIs:    []error{ErrDockerUnavailable, connFailed},
@@ -48,8 +47,6 @@ func TestWrapDockerErr(t *testing.T) {
 				"cannot reach the docker daemon",
 				host,
 				"is Docker running?",
-				"/var/run/docker.sock",
-				"/Users/dev/.docker/run/docker.sock",
 			},
 			// The clean message must not carry the inner op wrap prefix.
 			wantNoMsgSubstrs: []string{"inspect image"},
@@ -65,7 +62,7 @@ func TestWrapDockerErr(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := wrapDockerErr(tt.op, host, tried, tt.in)
+			got := wrapDockerErr(tt.op, host, tt.in)
 			require.Error(t, got)
 			for _, s := range tt.wantMsgSubstrs {
 				assert.Contains(t, got.Error(), s)
@@ -90,6 +87,6 @@ func TestWrapDockerErr(t *testing.T) {
 func TestWrapDockerErrRecognizesWrappedNotFound(t *testing.T) {
 	wrapped := fmt.Errorf("api call: %w", errdefs.NotFound(errors.New("missing")))
 
-	got := wrapDockerErr("remove container", "unix:///var/run/docker.sock", nil, wrapped)
+	got := wrapDockerErr("remove container", "unix:///var/run/docker.sock", wrapped)
 	assert.ErrorIs(t, got, ErrContainerNotFound)
 }

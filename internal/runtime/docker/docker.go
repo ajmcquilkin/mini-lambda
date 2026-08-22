@@ -15,7 +15,6 @@ import (
 	"io"
 	"os"
 	"sort"
-	"strings"
 
 	"github.com/ajmcquilkin/mini-lambda/internal/runtime"
 
@@ -53,9 +52,6 @@ const ManagedLabel = "mini-lambda.managed"
 // Runtime implements runtime.Runtime using the Docker Engine API.
 type Runtime struct {
 	cli *client.Client
-	// tried records the endpoint-resolution candidates probed by New, in order,
-	// so an unreachable-daemon error can report exactly what was attempted.
-	tried []string
 }
 
 // Compile-time assertion that Runtime satisfies the frozen interface.
@@ -65,17 +61,15 @@ var _ runtime.Runtime = (*Runtime)(nil)
 // (DOCKER_HOST, then the standard socket, then Docker Desktop's per-user socket)
 // with automatic API version negotiation.
 func New() (*Runtime, error) {
-	host, tried := resolveDockerHost(os.Getenv, fileExists)
-
 	opts := []client.Opt{client.WithAPIVersionNegotiation()}
-	if host != "" {
+	if host := resolveDockerHost(os.Getenv, fileExists); host != "" {
 		opts = append(opts, client.WithHost(host))
 	}
 	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("docker: new client: %w", err)
 	}
-	return &Runtime{cli: cli, tried: tried}, nil
+	return &Runtime{cli: cli}, nil
 }
 
 // resolveDockerHost selects the docker endpoint to connect to, probing in order:
@@ -85,30 +79,22 @@ func New() (*Runtime, error) {
 //  3. Docker Desktop's macOS per-user socket $HOME/.docker/run/docker.sock,
 //     which recent installs create instead of symlinking the standard socket.
 //
-// If none resolve it returns "" so the caller falls back to the SDK default, and
-// tried lists every candidate probed (for an actionable unreachable error). It
+// If none resolve it returns "" so the caller falls back to the SDK default. It
 // is pure: env and statExists are injected so it is table-testable without a
 // real environment or filesystem.
-func resolveDockerHost(env func(string) string, statExists func(string) bool) (host string, tried []string) {
+func resolveDockerHost(env func(string) string, statExists func(string) bool) string {
 	if h := env("DOCKER_HOST"); h != "" {
-		return h, []string{"DOCKER_HOST=" + h}
+		return h
 	}
-	tried = append(tried, "DOCKER_HOST unset")
-
-	tried = append(tried, stdDockerSocket)
 	if statExists(stdDockerSocket) {
-		return "unix://" + stdDockerSocket, tried
+		return "unix://" + stdDockerSocket
 	}
-
 	if home := env("HOME"); home != "" {
-		desktop := home + desktopSocketRel
-		tried = append(tried, desktop)
-		if statExists(desktop) {
-			return "unix://" + desktop, tried
+		if desktop := home + desktopSocketRel; statExists(desktop) {
+			return "unix://" + desktop
 		}
 	}
-
-	return "", tried
+	return ""
 }
 
 // fileExists reports whether path exists (a socket counts as existing).
@@ -267,28 +253,27 @@ func mergeEnv(base, overrides map[string]string) []string {
 }
 
 // wrap classifies a docker client error for op using this runtime's resolved
-// endpoint and probe list.
+// endpoint.
 func (r *Runtime) wrap(op string, err error) error {
-	return wrapDockerErr(op, r.cli.DaemonHost(), r.tried, err)
+	return wrapDockerErr(op, r.cli.DaemonHost(), err)
 }
 
 // wrapDockerErr maps a docker client error to a stable sentinel where it helps
 // callers, preserving the underlying error for errors.Is/As in every case:
 //
 //   - not-found        -> ErrContainerNotFound, with op context.
-//   - connection-failed -> ErrDockerUnavailable, with the endpoint in use, the
-//     probed candidates, and an "is Docker running?" hint (no op prefix, so the
-//     actionable message surfaces cleanly even through outer wrap chains).
+//   - connection-failed -> ErrDockerUnavailable, with the endpoint in use and an
+//     "is Docker running?" hint (no op prefix, so the actionable message
+//     surfaces cleanly even through outer wrap chains).
 //   - anything else     -> op context only.
 //
-// It is a pure function (host/tried injected) so it is table-testable.
-func wrapDockerErr(op, host string, tried []string, err error) error {
+// It is a pure function (host injected) so it is table-testable.
+func wrapDockerErr(op, host string, err error) error {
 	switch {
 	case client.IsErrNotFound(err):
 		return fmt.Errorf("docker: %s: %w: %w", op, ErrContainerNotFound, err)
 	case client.IsErrConnectionFailed(err):
-		return fmt.Errorf("%w at %s — is Docker running? (probed: %s): %w",
-			ErrDockerUnavailable, host, strings.Join(tried, ", "), err)
+		return fmt.Errorf("%w at %s — is Docker running?: %w", ErrDockerUnavailable, host, err)
 	default:
 		return fmt.Errorf("docker: %s: %w", op, err)
 	}
