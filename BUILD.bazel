@@ -1,4 +1,7 @@
 load("@gazelle//:def.bzl", "gazelle")
 
 # gazelle:prefix github.com/ajmcquilkin/mini-lambda
+# examples/ holds standalone teaching artifacts with their own go.mod files; keep
+# them out of the repo's Go module and Bazel graph entirely.
+# gazelle:exclude examples
 gazelle(name = "gazelle")
