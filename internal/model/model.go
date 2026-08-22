@@ -13,14 +13,13 @@ import (
 // Function is the persisted configuration of a Lambda function. Name is the
 // primary key.
 type Function struct {
-	Name          string            `json:"name"`
-	Image         string            `json:"image"`
-	Env           map[string]string `json:"env,omitempty"`
-	MemoryMB      int               `json:"memoryMB"`
-	TimeoutSec    int               `json:"timeoutSec"`
-	CreatedAt     time.Time         `json:"createdAt"`
-	UpdatedAt     time.Time         `json:"updatedAt"`
-	LastInvokedAt *time.Time        `json:"lastInvokedAt,omitempty"`
+	Name       string            `json:"name"`
+	Image      string            `json:"image"`
+	Env        map[string]string `json:"env,omitempty"`
+	MemoryMB   int               `json:"memoryMB"`
+	TimeoutSec int               `json:"timeoutSec"`
+	CreatedAt  time.Time         `json:"createdAt"`
+	UpdatedAt  time.Time         `json:"updatedAt"`
 }
 
 // InvokeRequest is a request to invoke a function by name with a raw payload.

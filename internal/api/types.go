@@ -50,15 +50,14 @@ type UpdateFunctionConfigurationRequest struct {
 // FunctionConfiguration is the response body echoing a function's config plus
 // timestamps. It is returned by create/get/update and nested in list.
 type FunctionConfiguration struct {
-	FunctionName  string       `json:"FunctionName"`
-	FunctionArn   string       `json:"FunctionArn"`
-	Code          Code         `json:"Code"`
-	Environment   *Environment `json:"Environment,omitempty"`
-	MemorySize    int          `json:"MemorySize"`
-	Timeout       int          `json:"Timeout"`
-	CreatedAt     time.Time    `json:"CreatedAt"`
-	LastModified  time.Time    `json:"LastModified"`
-	LastInvokedAt *time.Time   `json:"LastInvokedAt,omitempty"`
+	FunctionName string       `json:"FunctionName"`
+	FunctionArn  string       `json:"FunctionArn"`
+	Code         Code         `json:"Code"`
+	Environment  *Environment `json:"Environment,omitempty"`
+	MemorySize   int          `json:"MemorySize"`
+	Timeout      int          `json:"Timeout"`
+	CreatedAt    time.Time    `json:"CreatedAt"`
+	LastModified time.Time    `json:"LastModified"`
 }
 
 // ListFunctionsResponse is the body of GET /2015-03-31/functions.
@@ -69,14 +68,13 @@ type ListFunctionsResponse struct {
 // NewFunctionConfiguration projects a stored model.Function onto the wire type.
 func NewFunctionConfiguration(fn *model.Function) FunctionConfiguration {
 	cfg := FunctionConfiguration{
-		FunctionName:  fn.Name,
-		FunctionArn:   model.FunctionARN(fn.Name),
-		Code:          Code{ImageUri: fn.Image},
-		MemorySize:    fn.MemoryMB,
-		Timeout:       fn.TimeoutSec,
-		CreatedAt:     fn.CreatedAt,
-		LastModified:  fn.UpdatedAt,
-		LastInvokedAt: fn.LastInvokedAt,
+		FunctionName: fn.Name,
+		FunctionArn:  model.FunctionARN(fn.Name),
+		Code:         Code{ImageUri: fn.Image},
+		MemorySize:   fn.MemoryMB,
+		Timeout:      fn.TimeoutSec,
+		CreatedAt:    fn.CreatedAt,
+		LastModified: fn.UpdatedAt,
 	}
 	if len(fn.Env) > 0 {
 		cfg.Environment = &Environment{Variables: fn.Env}

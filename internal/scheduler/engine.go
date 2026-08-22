@@ -78,10 +78,6 @@ type Engine struct {
 
 	reaperStop chan struct{}
 	reaperDone chan struct{}
-
-	// touchWG tracks in-flight best-effort last_invoked_at updates so Shutdown
-	// can drain them.
-	touchWG sync.WaitGroup
 }
 
 var (
@@ -168,7 +164,7 @@ func (e *Engine) Invoke(ctx context.Context, fnName string, payload []byte) (*mo
 
 	select {
 	case o := <-p.result:
-		return e.finish(s, fn, o), nil
+		return e.finish(s, o), nil
 	case <-timer.C:
 		e.destroy(s)
 		return timeoutResult(p.inv, timeout), nil
@@ -184,7 +180,7 @@ type disposition int
 
 const (
 	// dispositionRelease returns the slot to the idle pool (the sandbox stays
-	// warm) and stamps last_invoked_at.
+	// warm).
 	dispositionRelease disposition = iota
 	// dispositionDestroy tears the slot down; the next invocation cold-starts.
 	dispositionDestroy
@@ -206,13 +202,13 @@ func classify(o outcome) (disposition, *model.InvokeResult) {
 
 // finish classifies a terminal outcome, then applies the effects for its
 // disposition: release the slot to the idle pool (success/handler-error keep the
-// sandbox warm) and stamp last_invoked_at, or destroy it (init failure).
-func (e *Engine) finish(s *slot, fn *model.Function, o outcome) *model.InvokeResult {
+// sandbox warm), or destroy it (init failure). Invocation performs no store
+// write; a function's stored row is only touched by explicit config changes.
+func (e *Engine) finish(s *slot, o outcome) *model.InvokeResult {
 	d, res := classify(o)
 	switch d {
 	case dispositionRelease:
 		e.release(s)
-		e.touchLastInvoked(fn.Name)
 	default: // dispositionDestroy
 		e.destroy(s)
 	}
@@ -308,24 +304,6 @@ func (e *Engine) stopContainer(s *slot) {
 	_ = e.rt.Remove(ctx, s.containerID)
 }
 
-// touchLastInvoked best-effort stamps the function's last_invoked_at. It runs
-// asynchronously and swallows errors: invocation success does not depend on it.
-func (e *Engine) touchLastInvoked(name string) {
-	e.touchWG.Add(1)
-	go func() {
-		defer e.touchWG.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		fn, err := e.store.GetFunction(ctx, name)
-		if err != nil {
-			return
-		}
-		now := e.now().UTC()
-		fn.LastInvokedAt = &now
-		_ = e.store.UpdateFunctionConfiguration(ctx, fn)
-	}()
-}
-
 // FunctionContainerIDs returns the container IDs of the live slots (idle+busy)
 // for name, in no particular order. Used by the daemon's log endpoint.
 func (e *Engine) FunctionContainerIDs(name string) []string {
@@ -351,7 +329,6 @@ func (e *Engine) Shutdown(ctx context.Context) error {
 
 	close(e.reaperStop)
 	<-e.reaperDone
-	e.touchWG.Wait()
 
 	// Tear slots down concurrently so per-container stop grace periods don't
 	// serialize into a total that blows the caller's shutdown budget.

@@ -48,15 +48,14 @@ func newHarness(t *testing.T, fn model.Function, cfg Config) *harness {
 		rt:    runtimemock.NewMockRuntime(ctrl),
 	}
 
-	// GetFunction returns a fresh copy so the async last_invoked_at updater and
-	// the invoke path never share a *model.Function.
+	// GetFunction returns a fresh copy so callers never share a *model.Function.
+	// No write method is expected: invocation performs no store write, so any
+	// UpdateFunctionConfiguration call here would be an unexpected-call failure.
 	h.store.EXPECT().GetFunction(gomock.Any(), fn.Name).
 		DoAndReturn(func(_ context.Context, _ string) (*model.Function, error) {
 			cp := fn
 			return &cp, nil
 		}).AnyTimes()
-	h.store.EXPECT().UpdateFunctionConfiguration(gomock.Any(), gomock.Any()).
-		Return(nil).AnyTimes()
 
 	if cfg.now == nil {
 		cfg.now = time.Now
@@ -172,6 +171,57 @@ func TestInvokeSuccessAndWarmReuse(t *testing.T) {
 
 	// The second invoke reused the warm slot rather than cold-starting.
 	assert.Equal(t, 1, h.creates())
+}
+
+// TestInvokePerformsNoStoreWrite proves invoking a function never writes to the
+// store: the only store interaction is the GetFunction read used to load config.
+// last_invoked_at tracking was removed, so a function's stored row (and its
+// LastModified/updated_at) changes only on an explicit config update.
+func TestInvokePerformsNoStoreWrite(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	st := storemock.NewMockStore(ctrl)
+	rt := runtimemock.NewMockRuntime(ctrl)
+	fn := testFunction()
+
+	st.EXPECT().GetFunction(gomock.Any(), fn.Name).
+		DoAndReturn(func(_ context.Context, _ string) (*model.Function, error) {
+			cp := fn
+			return &cp, nil
+		}).AnyTimes()
+	// Any of these being called during an invoke is a bug: assert zero writes.
+	st.EXPECT().CreateFunction(gomock.Any(), gomock.Any()).Times(0)
+	st.EXPECT().UpdateFunctionConfiguration(gomock.Any(), gomock.Any()).Times(0)
+	st.EXPECT().DeleteFunction(gomock.Any(), gomock.Any()).Times(0)
+
+	rt.EXPECT().Pull(gomock.Any(), fn.Image).Return(nil).AnyTimes()
+	rt.EXPECT().Start(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	rt.EXPECT().Stop(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	rt.EXPECT().Remove(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	var eng *Engine
+	// Cold start spawns a fake RIC that echoes the delivered payload.
+	rt.EXPECT().Create(gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, spec runtime.ContainerSpec) (string, error) {
+			token := tokenFromSpec(spec)
+			if slot, ok := eng.LookupSlot(token); ok {
+				go func() {
+					inv, err := slot.Next(context.Background())
+					if err != nil {
+						return
+					}
+					_ = slot.Respond(inv.RequestID, inv.Payload)
+				}()
+			}
+			return "container-1", nil
+		}).AnyTimes()
+
+	eng = New(st, rt, Config{})
+	t.Cleanup(func() { _ = eng.Shutdown(context.Background()) })
+
+	res, err := eng.Invoke(t.Context(), fn.Name, []byte(`{"n":1}`))
+	require.NoError(t, err)
+	assert.Equal(t, `{"n":1}`, string(res.Payload))
+	// gomock verifies the Times(0) write expectations on ctrl.Finish (t.Cleanup).
 }
 
 func TestInvokeHandlerErrorKeepsSlotWarm(t *testing.T) {

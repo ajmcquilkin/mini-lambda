@@ -108,8 +108,8 @@ func (s *SQLite) CreateFunction(ctx context.Context, fn *model.Function) error {
 	}
 
 	const q = `INSERT INTO functions
-		(name, image, env, memory_mb, timeout_sec, created_at, updated_at, last_invoked_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+		(name, image, env, memory_mb, timeout_sec, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`
 
 	_, err = s.db.ExecContext(ctx, q,
 		fn.Name,
@@ -119,7 +119,6 @@ func (s *SQLite) CreateFunction(ctx context.Context, fn *model.Function) error {
 		fn.TimeoutSec,
 		fn.CreatedAt.UTC().Format(timeFormat),
 		fn.UpdatedAt.UTC().Format(timeFormat),
-		nullableTime(fn.LastInvokedAt),
 	)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -132,7 +131,7 @@ func (s *SQLite) CreateFunction(ctx context.Context, fn *model.Function) error {
 
 // GetFunction returns the function named name, or ErrNotFound.
 func (s *SQLite) GetFunction(ctx context.Context, name string) (*model.Function, error) {
-	const q = `SELECT name, image, env, memory_mb, timeout_sec, created_at, updated_at, last_invoked_at
+	const q = `SELECT name, image, env, memory_mb, timeout_sec, created_at, updated_at
 		FROM functions WHERE name = ?`
 
 	fn, err := scanFunction(s.db.QueryRowContext(ctx, q, name))
@@ -147,7 +146,7 @@ func (s *SQLite) GetFunction(ctx context.Context, name string) (*model.Function,
 
 // ListFunctions returns all functions ordered by name.
 func (s *SQLite) ListFunctions(ctx context.Context) ([]*model.Function, error) {
-	const q = `SELECT name, image, env, memory_mb, timeout_sec, created_at, updated_at, last_invoked_at
+	const q = `SELECT name, image, env, memory_mb, timeout_sec, created_at, updated_at
 		FROM functions ORDER BY name`
 
 	rows, err := s.db.QueryContext(ctx, q)
@@ -181,7 +180,7 @@ func (s *SQLite) UpdateFunctionConfiguration(ctx context.Context, fn *model.Func
 
 	now := time.Now().UTC()
 	const q = `UPDATE functions SET
-		image = ?, env = ?, memory_mb = ?, timeout_sec = ?, updated_at = ?, last_invoked_at = ?
+		image = ?, env = ?, memory_mb = ?, timeout_sec = ?, updated_at = ?
 		WHERE name = ?`
 
 	res, err := s.db.ExecContext(ctx, q,
@@ -190,7 +189,6 @@ func (s *SQLite) UpdateFunctionConfiguration(ctx context.Context, fn *model.Func
 		fn.MemoryMB,
 		fn.TimeoutSec,
 		now.Format(timeFormat),
-		nullableTime(fn.LastInvokedAt),
 		fn.Name,
 	)
 	if err != nil {
@@ -242,9 +240,8 @@ func scanFunction(r rowScanner) (*model.Function, error) {
 		env     string
 		created string
 		updated string
-		invoked sql.NullString
 	)
-	if err := r.Scan(&fn.Name, &fn.Image, &env, &fn.MemoryMB, &fn.TimeoutSec, &created, &updated, &invoked); err != nil {
+	if err := r.Scan(&fn.Name, &fn.Image, &env, &fn.MemoryMB, &fn.TimeoutSec, &created, &updated); err != nil {
 		return nil, err
 	}
 
@@ -258,13 +255,6 @@ func scanFunction(r rowScanner) (*model.Function, error) {
 	}
 	if fn.UpdatedAt, err = parseTime(updated); err != nil {
 		return nil, fmt.Errorf("store: parse updated_at: %w", err)
-	}
-	if invoked.Valid {
-		t, err := parseTime(invoked.String)
-		if err != nil {
-			return nil, fmt.Errorf("store: parse last_invoked_at: %w", err)
-		}
-		fn.LastInvokedAt = &t
 	}
 	return &fn, nil
 }
@@ -292,13 +282,6 @@ func decodeEnv(s string, dst *map[string]string) error {
 		*dst = m
 	}
 	return nil
-}
-
-func nullableTime(t *time.Time) any {
-	if t == nil {
-		return nil
-	}
-	return t.UTC().Format(timeFormat)
 }
 
 func parseTime(s string) (time.Time, error) {
