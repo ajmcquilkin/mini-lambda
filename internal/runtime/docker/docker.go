@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"sort"
 
 	"github.com/ajmcquilkin/mini-lambda/internal/runtime"
@@ -29,6 +30,21 @@ import (
 // error types.
 var ErrContainerNotFound = errors.New("docker: container not found")
 
+// ErrDockerUnavailable is returned when the docker daemon cannot be reached
+// (e.g. Docker Desktop is not running, or it listens on a socket we did not
+// probe). It wraps the underlying connection error so callers can match on this
+// stable sentinel via errors.Is and surface an actionable message.
+var ErrDockerUnavailable = errors.New("cannot reach the docker daemon")
+
+// stdDockerSocket is the conventional daemon socket most Linux installs and
+// older Docker Desktop builds expose (or symlink to).
+const stdDockerSocket = "/var/run/docker.sock"
+
+// desktopSocketRel is Docker Desktop's macOS per-user socket, relative to $HOME.
+// Recent installs create this instead of symlinking stdDockerSocket, so a bare
+// client.FromEnv (which defaults to stdDockerSocket) probes the wrong endpoint.
+const desktopSocketRel = "/.docker/run/docker.sock"
+
 // ManagedLabel marks containers created by this runtime so they can be
 // discovered and cleaned up later.
 const ManagedLabel = "mini-lambda.managed"
@@ -41,14 +57,65 @@ type Runtime struct {
 // Compile-time assertion that Runtime satisfies the frozen interface.
 var _ runtime.Runtime = (*Runtime)(nil)
 
-// New constructs a Runtime using the ambient docker environment
-// (DOCKER_HOST, etc.) with automatic API version negotiation.
+// New constructs a Runtime, resolving the docker endpoint via resolveDockerHost
+// (DOCKER_HOST, then the standard socket, then Docker Desktop's per-user socket)
+// with automatic API version negotiation.
 func New() (*Runtime, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	opts := []client.Opt{client.WithAPIVersionNegotiation()}
+	if host := resolveDockerHost(os.Getenv, fileExists); host != "" {
+		opts = append(opts, client.WithHost(host))
+	}
+	cli, err := client.NewClientWithOpts(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("docker: new client: %w", err)
 	}
 	return &Runtime{cli: cli}, nil
+}
+
+// resolveDockerHost selects the docker endpoint to connect to, probing in order:
+//
+//  1. DOCKER_HOST from the environment (honored as-is, unchanged behavior).
+//  2. The standard socket /var/run/docker.sock.
+//  3. Docker Desktop's macOS per-user socket $HOME/.docker/run/docker.sock,
+//     which recent installs create instead of symlinking the standard socket.
+//
+// If none resolve it returns "" so the caller falls back to the SDK default. It
+// is pure: env and statExists are injected so it is table-testable without a
+// real environment or filesystem.
+func resolveDockerHost(env func(string) string, statExists func(string) bool) string {
+	if h := env("DOCKER_HOST"); h != "" {
+		return h
+	}
+	if statExists(stdDockerSocket) {
+		return "unix://" + stdDockerSocket
+	}
+	if home := env("HOME"); home != "" {
+		if desktop := home + desktopSocketRel; statExists(desktop) {
+			return "unix://" + desktop
+		}
+	}
+	return ""
+}
+
+// fileExists reports whether path exists (a socket counts as existing).
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// Ping verifies the docker daemon is reachable. A connection failure maps to
+// ErrDockerUnavailable (with the resolved endpoint and probed candidates) so the
+// daemon can log an actionable startup warning.
+func (r *Runtime) Ping(ctx context.Context) error {
+	if _, err := r.cli.Ping(ctx); err != nil {
+		return r.wrap("ping", err)
+	}
+	return nil
+}
+
+// Endpoint reports the docker host the client is configured to use.
+func (r *Runtime) Endpoint() string {
+	return r.cli.DaemonHost()
 }
 
 // Pull ensures the image is present locally. If the image already exists it
@@ -58,12 +125,12 @@ func (r *Runtime) Pull(ctx context.Context, imageRef string) error {
 	if _, err := r.cli.ImageInspect(ctx, imageRef); err == nil {
 		return nil
 	} else if !client.IsErrNotFound(err) {
-		return fmt.Errorf("docker: inspect image %q: %w", imageRef, err)
+		return r.wrap(fmt.Sprintf("inspect image %q", imageRef), err)
 	}
 
 	rc, err := r.cli.ImagePull(ctx, imageRef, image.PullOptions{})
 	if err != nil {
-		return fmt.Errorf("docker: pull image %q: %w", imageRef, err)
+		return r.wrap(fmt.Sprintf("pull image %q", imageRef), err)
 	}
 	defer rc.Close()
 
@@ -94,7 +161,7 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.ContainerSpec) (strin
 
 	resp, err := r.cli.ContainerCreate(ctx, config, hostConfig, nil, nil, "")
 	if err != nil {
-		return "", fmt.Errorf("docker: create container from %q: %w", spec.Image, err)
+		return "", r.wrap(fmt.Sprintf("create container from %q", spec.Image), err)
 	}
 	return resp.ID, nil
 }
@@ -102,7 +169,7 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.ContainerSpec) (strin
 // Start starts a previously created container.
 func (r *Runtime) Start(ctx context.Context, id string) error {
 	if err := r.cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
-		return wrapNotFound(fmt.Sprintf("start container %q", id), err)
+		return r.wrap(fmt.Sprintf("start container %q", id), err)
 	}
 	return nil
 }
@@ -112,7 +179,7 @@ func (r *Runtime) Start(ctx context.Context, id string) error {
 func (r *Runtime) Stop(ctx context.Context, id string) error {
 	timeout := stopTimeoutSeconds
 	if err := r.cli.ContainerStop(ctx, id, container.StopOptions{Timeout: &timeout}); err != nil {
-		return wrapNotFound(fmt.Sprintf("stop container %q", id), err)
+		return r.wrap(fmt.Sprintf("stop container %q", id), err)
 	}
 	return nil
 }
@@ -120,7 +187,7 @@ func (r *Runtime) Stop(ctx context.Context, id string) error {
 // Remove force-deletes a container.
 func (r *Runtime) Remove(ctx context.Context, id string) error {
 	if err := r.cli.ContainerRemove(ctx, id, container.RemoveOptions{Force: true}); err != nil {
-		return wrapNotFound(fmt.Sprintf("remove container %q", id), err)
+		return r.wrap(fmt.Sprintf("remove container %q", id), err)
 	}
 	return nil
 }
@@ -136,7 +203,7 @@ func (r *Runtime) Logs(ctx context.Context, id string, follow bool) (io.ReadClos
 		Timestamps: false,
 	})
 	if err != nil {
-		return nil, wrapNotFound(fmt.Sprintf("logs for container %q", id), err)
+		return nil, r.wrap(fmt.Sprintf("logs for container %q", id), err)
 	}
 
 	pr, pw := io.Pipe()
@@ -185,12 +252,29 @@ func mergeEnv(base, overrides map[string]string) []string {
 	return out
 }
 
-// wrapNotFound maps docker "not found" errors to ErrContainerNotFound and wraps
-// everything else with context. The returned error still unwraps to the docker
-// error for callers that want detail.
-func wrapNotFound(op string, err error) error {
-	if client.IsErrNotFound(err) {
+// wrap classifies a docker client error for op using this runtime's resolved
+// endpoint.
+func (r *Runtime) wrap(op string, err error) error {
+	return wrapDockerErr(op, r.cli.DaemonHost(), err)
+}
+
+// wrapDockerErr maps a docker client error to a stable sentinel where it helps
+// callers, preserving the underlying error for errors.Is/As in every case:
+//
+//   - not-found        -> ErrContainerNotFound, with op context.
+//   - connection-failed -> ErrDockerUnavailable, with the endpoint in use and an
+//     "is Docker running?" hint (no op prefix, so the actionable message
+//     surfaces cleanly even through outer wrap chains).
+//   - anything else     -> op context only.
+//
+// It is a pure function (host injected) so it is table-testable.
+func wrapDockerErr(op, host string, err error) error {
+	switch {
+	case client.IsErrNotFound(err):
 		return fmt.Errorf("docker: %s: %w: %w", op, ErrContainerNotFound, err)
+	case client.IsErrConnectionFailed(err):
+		return fmt.Errorf("%w at %s — is Docker running?: %w", ErrDockerUnavailable, host, err)
+	default:
+		return fmt.Errorf("docker: %s: %w", op, err)
 	}
-	return fmt.Errorf("docker: %s: %w", op, err)
 }

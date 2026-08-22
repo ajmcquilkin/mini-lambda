@@ -80,6 +80,52 @@ func TestListenerPort(t *testing.T) {
 	}
 }
 
+func TestStartupLine(t *testing.T) {
+	reachable := reachableHost("host.docker.internal", 9001)
+	runtimeAddr := &net.TCPAddr{IP: net.IPv4(0, 0, 0, 0), Port: 9001}
+
+	got := startupLine("127.0.0.1:9000", runtimeAddr, reachable)
+
+	// The resolved host string must appear verbatim; the old bug logged the
+	// reachableHost function value ("%!s(func...)") instead.
+	assert.Contains(t, got, reachable)
+	assert.NotContains(t, got, "%!")
+	assert.Equal(t, "mini-lambda daemon listening: api=127.0.0.1:9000 runtime-api=0.0.0.0:9001 (reachable as host.docker.internal:9001)", got)
+}
+
+// fakePinger is a hand-rolled dockerPinger: Ping returns pingErr and Endpoint
+// returns endpoint, so the startup connectivity line can be exercised without a
+// real docker daemon.
+type fakePinger struct {
+	pingErr  error
+	endpoint string
+}
+
+func (f fakePinger) Ping(context.Context) error { return f.pingErr }
+func (f fakePinger) Endpoint() string           { return f.endpoint }
+
+func TestCheckDocker_ReachableNamesEndpoint(t *testing.T) {
+	p := fakePinger{endpoint: "unix:///Users/dev/.docker/run/docker.sock"}
+
+	got := checkDocker(t.Context(), p)
+
+	assert.Contains(t, got, "reachable")
+	assert.Contains(t, got, p.endpoint)
+	assert.NotContains(t, got, "WARNING")
+}
+
+func TestCheckDocker_UnreachableWarnsButKeepsServing(t *testing.T) {
+	// The runtime's error already carries the actionable detail; the daemon must
+	// surface it as a warning and make clear it keeps serving.
+	p := fakePinger{pingErr: errors.New("cannot reach the docker daemon at unix:///var/run/docker.sock — is Docker running?")}
+
+	got := checkDocker(t.Context(), p)
+
+	assert.Contains(t, got, "WARNING")
+	assert.Contains(t, got, "is Docker running?")
+	assert.Contains(t, got, "starting anyway")
+}
+
 // fakeFns is a hand-rolled functionExister: it reports whether a function
 // exists via the error it returns from GetFunction.
 type fakeFns struct {

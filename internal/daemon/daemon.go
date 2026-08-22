@@ -89,6 +89,12 @@ func Run(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("daemon: docker runtime: %w", err)
 	}
 
+	// Probe docker up front so a misconfigured/unreachable daemon surfaces as a
+	// prominent, actionable startup warning instead of a cryptic error on the
+	// first invoke. We still start serving: docker may come up later, and only
+	// invocations (not the control plane) depend on it.
+	cfg.logf("%s", checkDocker(ctx, rt))
+
 	// Bind the Runtime API listener first so we know its port before building the
 	// scheduler, which bakes "<host>:<port>/<token>" into each container's env.
 	runtimeLn, err := net.Listen("tcp", cfg.RuntimeAddr)
@@ -120,7 +126,7 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { serveErr <- ignoreClosed(runtimeSrv.Serve(runtimeLn)) }()
 	go func() { serveErr <- ignoreClosed(apiSrv.Serve(apiLn)) }()
 
-	cfg.logf("mini-lambda daemon listening: api=%s runtime-api=%s (reachable as %s)", cfg.Addr, runtimeLn.Addr(), reachableHost)
+	cfg.logf("%s", startupLine(cfg.Addr, runtimeLn.Addr(), reachable))
 
 	select {
 	case <-ctx.Done():
@@ -267,6 +273,36 @@ func openStore(ctx context.Context, dataDir string) (store.Store, error) {
 // into each container's env).
 func reachableHost(hostname string, port int) string {
 	return fmt.Sprintf("%s:%d", hostname, port)
+}
+
+// dockerPinger is the minimal slice of the docker runtime the startup
+// connectivity check needs. *docker.Runtime satisfies it; keeping it here avoids
+// widening the frozen runtime.Runtime interface with a Ping method.
+type dockerPinger interface {
+	Ping(ctx context.Context) error
+	Endpoint() string
+}
+
+// checkDocker pings docker and returns the startup log line to emit.
+func checkDocker(ctx context.Context, p dockerPinger) string {
+	return dockerStatusLine(p, p.Ping(ctx))
+}
+
+// dockerStatusLine renders the docker-connectivity startup line from a ping
+// result. On success it names the resolved endpoint; on failure it surfaces the
+// runtime's actionable error (endpoint, probed sockets, "is Docker running?")
+// as a warning and notes that serving continues regardless.
+func dockerStatusLine(p dockerPinger, pingErr error) string {
+	if pingErr != nil {
+		return fmt.Sprintf("WARNING: %v — starting anyway; invocations will fail until Docker is reachable", pingErr)
+	}
+	return fmt.Sprintf("docker daemon reachable at %s", p.Endpoint())
+}
+
+// startupLine renders the daemon's "listening" log line. reachable is the
+// already-resolved "host:port" string (from reachableHost), not the function.
+func startupLine(apiAddr string, runtimeAddr net.Addr, reachable string) string {
+	return fmt.Sprintf("mini-lambda daemon listening: api=%s runtime-api=%s (reachable as %s)", apiAddr, runtimeAddr, reachable)
 }
 
 // listenerPort extracts the TCP port a listener bound to. It returns 0 for a
