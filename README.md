@@ -75,20 +75,35 @@ curl -s -XPOST http://127.0.0.1:9000/2015-03-31/functions/hello/invocations -d '
 The daemon prints exactly one machine-parseable line to stdout when it is genuinely ready — migrations applied, both listeners bound and serving, and docker pinged:
 
 ```
-MINI_LAMBDA_READY api=<host:port> runtime=<host:port>
+MINI_LAMBDA_READY api=<host:port> runtime=<host:port> runtime_reachable=<host:port> pid=<n>
 ```
 
-Both addresses are the *resolved* listeners, so with `--addr 127.0.0.1:0` the `api=` field carries the OS-chosen port. This line is a stable API: scripts can block on it and parse the ports out of it. It is emitted last, after the human-readable startup log, so seeing it means every readiness step is done.
+- `api` / `runtime` — the *resolved* listen addresses, so with `--addr 127.0.0.1:0` the `api=` field carries the OS-chosen port. `runtime` is the raw Runtime API bind address (e.g. `[::]:9001`).
+- `runtime_reachable` — the host:port a **container** dials to reach the Runtime API (the value injected into `AWS_LAMBDA_RUNTIME_API`, e.g. `host.docker.internal:9001`). Use this rather than substituting the host into `runtime` yourself.
+- `pid` — the daemon process id. Signal *this* pid to stop the daemon (see the sudo note below).
+
+This line is a stable API: scripts can block on it and parse the fields out of it. It is emitted last, after the human-readable startup log, so seeing it means every readiness step is done.
 
 #### `--port-file`
 
-`--port-file <path>` writes the same resolved addresses as JSON at the readiness moment, so a supervisor doesn't have to scrape stdout:
+`--port-file <path>` writes the same resolved values as JSON at the readiness moment, so a supervisor doesn't have to scrape stdout:
 
 ```json
-{"api":"127.0.0.1:53124","runtime":"0.0.0.0:53125"}
+{"api":"127.0.0.1:53124","runtime":"[::]:53125","runtime_reachable":"host.docker.internal:53125","pid":8123}
 ```
 
-It is written atomically (temp file + rename, so a reader never sees a partial document) and best-effort removed on shutdown.
+It is written atomically (temp file + rename, so a reader never sees a partial document), created world-readable (`0644` — ports aren't secrets, so a cross-user harness can read a file a root/sudo daemon wrote), and best-effort removed on shutdown.
+
+#### Shutdown contract (`MINI_LAMBDA_SHUTDOWN`)
+
+On a clean exit (`SIGTERM`/`SIGINT`) the daemon prints exactly one machine-parseable line as the **last** thing before exiting `0`:
+
+```
+MINI_LAMBDA_SHUTDOWN complete   # in-flight invocations drained within --shutdown-timeout
+MINI_LAMBDA_SHUTDOWN forced     # the --shutdown-timeout bound elapsed first; teardown was forced
+```
+
+A harness can block on this line to know teardown (containers stopped+removed) has actually finished, rather than racing the process exit.
 
 #### `GET /healthz`
 
@@ -102,7 +117,9 @@ The public mux serves `GET /healthz`, returning `200` with a small JSON body onc
 
 #### Clean teardown and orphan reaping
 
-On `SIGTERM`/`SIGINT` the daemon stops accepting new invocations, drains in-flight ones for up to `--shutdown-timeout`, then stops and removes every container it manages (labeled `mini-lambda.managed=true`) and exits `0`.
+On `SIGTERM`/`SIGINT` the daemon stops accepting new invocations, drains in-flight ones for up to `--shutdown-timeout`, then stops and removes every container it manages (labeled `mini-lambda.managed=true`), prints the `MINI_LAMBDA_SHUTDOWN` line, and exits `0`.
+
+> **Signalling under `sudo`.** If you launch the daemon via `sudo`, send `SIGTERM` to the daemon process itself, not the `sudo` wrapper — `sudo` does not reliably relay signals to the child. The daemon's pid is in the readiness contract (`pid=` on the READY line and `"pid"` in the port file), so a harness can target it directly: `kill -TERM "$(jq -r .pid ports.json)"`.
 
 That covers graceful exits. A daemon that is `SIGKILL`ed or crashes can't clean up after itself, so every container is also stamped with its owner's identity — a per-run instance id (`mini-lambda.instance`), the owner pid (`mini-lambda.owner-pid`), and the owner host (`mini-lambda.owner-host`). On startup the reaper (default on; `--reap-orphans=false` disables) lists managed containers and removes any whose owning daemon is dead, decided as:
 
