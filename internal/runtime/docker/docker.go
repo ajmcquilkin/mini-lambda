@@ -19,6 +19,7 @@ import (
 	"github.com/ajmcquilkin/mini-lambda/internal/runtime"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -45,9 +46,25 @@ const stdDockerSocket = "/var/run/docker.sock"
 // client.FromEnv (which defaults to stdDockerSocket) probes the wrong endpoint.
 const desktopSocketRel = "/.docker/run/docker.sock"
 
-// ManagedLabel marks containers created by this runtime so they can be
-// discovered and cleaned up later.
-const ManagedLabel = "mini-lambda.managed"
+// Container ownership labels. ManagedLabel marks every container this runtime
+// creates so they can be discovered and cleaned up later; the remaining labels
+// record which daemon run owns a container so a later daemon's startup reaper
+// can tell a dead owner's orphans (safe to remove) from a live peer's
+// containers (must never be touched). The scheduler supplies the owner-* values
+// via ContainerSpec.Labels; ManagedLabel is always stamped by Create.
+const (
+	ManagedLabel   = "mini-lambda.managed"
+	InstanceLabel  = "mini-lambda.instance"
+	OwnerPIDLabel  = "mini-lambda.owner-pid"
+	OwnerHostLabel = "mini-lambda.owner-host"
+)
+
+// ManagedContainer is a container carrying ManagedLabel, reported by
+// ListManaged with the labels the reaper needs to determine ownership.
+type ManagedContainer struct {
+	ID     string
+	Labels map[string]string
+}
 
 // Runtime implements runtime.Runtime using the Docker Engine API.
 type Runtime struct {
@@ -145,11 +162,9 @@ func (r *Runtime) Pull(ctx context.Context, imageRef string) error {
 // collisions. The memory limit is applied in bytes; no ports are published.
 func (r *Runtime) Create(ctx context.Context, spec runtime.ContainerSpec) (string, error) {
 	config := &container.Config{
-		Image: spec.Image,
-		Env:   mergeEnv(spec.Env, spec.RuntimeAPIEnv),
-		Labels: map[string]string{
-			ManagedLabel: "true",
-		},
+		Image:  spec.Image,
+		Env:    mergeEnv(spec.Env, spec.RuntimeAPIEnv),
+		Labels: managedLabels(spec.Labels),
 	}
 
 	hostConfig := &container.HostConfig{
@@ -164,6 +179,26 @@ func (r *Runtime) Create(ctx context.Context, spec runtime.ContainerSpec) (strin
 		return "", r.wrap(fmt.Sprintf("create container from %q", spec.Image), err)
 	}
 	return resp.ID, nil
+}
+
+// ListManaged returns every container carrying ManagedLabel (running or not,
+// across all daemon runs on this docker host), with the labels needed to
+// determine ownership. It is the "list managed containers by label" capability
+// the startup reaper needs; it lives on the concrete *Runtime rather than the
+// frozen runtime.Runtime interface, mirroring how Ping/Endpoint are kept off
+// that interface.
+func (r *Runtime) ListManaged(ctx context.Context) ([]ManagedContainer, error) {
+	f := filters.NewArgs()
+	f.Add("label", ManagedLabel+"=true")
+	list, err := r.cli.ContainerList(ctx, container.ListOptions{All: true, Filters: f})
+	if err != nil {
+		return nil, r.wrap("list managed containers", err)
+	}
+	out := make([]ManagedContainer, 0, len(list))
+	for _, c := range list {
+		out = append(out, ManagedContainer{ID: c.ID, Labels: c.Labels})
+	}
+	return out, nil
 }
 
 // Start starts a previously created container.
@@ -226,6 +261,18 @@ func memoryBytes(memoryMB int) int64 {
 		return 0
 	}
 	return int64(memoryMB) * 1024 * 1024
+}
+
+// managedLabels builds a container's label set: ManagedLabel is always
+// present, plus any caller-supplied ownership labels. Callers cannot override
+// ManagedLabel, so ListManaged always finds every container Create made.
+func managedLabels(extra map[string]string) map[string]string {
+	labels := make(map[string]string, len(extra)+1)
+	for k, v := range extra {
+		labels[k] = v
+	}
+	labels[ManagedLabel] = "true"
+	return labels
 }
 
 // mergeEnv merges base env with overrides (overrides win on collision) and

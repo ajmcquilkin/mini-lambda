@@ -13,11 +13,11 @@ var _ runtime.Runtime = (*Runtime)(nil)
 
 func TestMergeEnvPrecedence(t *testing.T) {
 	base := map[string]string{
-		"SHARED": "from-base",
+		"SHARED":    "from-base",
 		"ONLY_BASE": "base",
 	}
 	overrides := map[string]string{
-		"SHARED":    "from-runtime",
+		"SHARED":                 "from-runtime",
 		"AWS_LAMBDA_RUNTIME_API": "127.0.0.1:9001",
 	}
 
@@ -43,6 +43,37 @@ func TestMergeEnvNilMaps(t *testing.T) {
 	want := []string{"A=1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("mergeEnv(nil, override) = %v, want %v", got, want)
+	}
+}
+
+func TestManagedLabels(t *testing.T) {
+	// ManagedLabel is always present so ListManaged finds every created container.
+	got := managedLabels(nil)
+	if got[ManagedLabel] != "true" {
+		t.Fatalf("managedLabels(nil)[%q] = %q, want \"true\"", ManagedLabel, got[ManagedLabel])
+	}
+
+	// Caller-supplied ownership labels are carried through alongside it.
+	extra := map[string]string{
+		InstanceLabel:  "inst-1",
+		OwnerHostLabel: "hostA",
+		OwnerPIDLabel:  "4242",
+	}
+	got = managedLabels(extra)
+	want := map[string]string{
+		ManagedLabel:   "true",
+		InstanceLabel:  "inst-1",
+		OwnerHostLabel: "hostA",
+		OwnerPIDLabel:  "4242",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("managedLabels(extra) = %v, want %v", got, want)
+	}
+
+	// The caller cannot clobber the managed marker.
+	got = managedLabels(map[string]string{ManagedLabel: "false"})
+	if got[ManagedLabel] != "true" {
+		t.Fatalf("managedLabels must not let callers override ManagedLabel; got %q", got[ManagedLabel])
 	}
 }
 
