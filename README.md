@@ -60,12 +60,59 @@ curl -s -XPOST http://127.0.0.1:9000/2015-03-31/functions/hello/invocations -d '
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--addr` | `127.0.0.1:9000` | Public (AWS-shaped) API listen address. |
+| `--addr` | `127.0.0.1:9000` | Public (AWS-shaped) API listen address. Accepts a `:0` port (e.g. `127.0.0.1:0`) to let the OS pick a free port; discover the resolved port via the READY line or `--port-file`. |
 | `--runtime-addr` | `0.0.0.0:0` | Runtime API listen address. Bind `0.0.0.0` so containers can reach it; `:0` picks a free port. |
 | `--data` | `~/.mini-lambda` | Directory for the SQLite state database. |
 | `--max-concurrency` | `32` | Daemon-wide cap on concurrent slots (containers). |
 | `--per-function-concurrency` | `4` | Per-function cap on concurrent slots. |
 | `--idle-ttl` | `5m` | How long an idle warm slot survives before it's reaped. |
+| `--port-file` | *(none)* | Path to atomically write the resolved listen addresses as JSON at readiness (see below). |
+| `--shutdown-timeout` | `20s` | Max time to drain in-flight invocations on `SIGTERM`/`SIGINT` before containers are force-stopped. |
+| `--reap-orphans` | `true` | On startup, remove managed containers whose owning daemon has died (pass `--reap-orphans=false` to disable). |
+
+#### Readiness contract (`MINI_LAMBDA_READY`)
+
+The daemon prints exactly one machine-parseable line to stdout when it is genuinely ready — migrations applied, both listeners bound and serving, and docker pinged:
+
+```
+MINI_LAMBDA_READY api=<host:port> runtime=<host:port>
+```
+
+Both addresses are the *resolved* listeners, so with `--addr 127.0.0.1:0` the `api=` field carries the OS-chosen port. This line is a stable API: scripts can block on it and parse the ports out of it. It is emitted last, after the human-readable startup log, so seeing it means every readiness step is done.
+
+#### `--port-file`
+
+`--port-file <path>` writes the same resolved addresses as JSON at the readiness moment, so a supervisor doesn't have to scrape stdout:
+
+```json
+{"api":"127.0.0.1:53124","runtime":"0.0.0.0:53125"}
+```
+
+It is written atomically (temp file + rename, so a reader never sees a partial document) and best-effort removed on shutdown.
+
+#### `GET /healthz`
+
+The public mux serves `GET /healthz`, returning `200` with a small JSON body once the daemon is serving:
+
+```json
+{"status":"ok","docker":"ok"}
+```
+
+`status` is the readiness signal CI wants ("the daemon is up") and is always `ok` while serving. `docker` is informational only (`ok` | `unreachable`) and never changes the status code — a daemon serving with docker down is still `200`.
+
+#### Clean teardown and orphan reaping
+
+On `SIGTERM`/`SIGINT` the daemon stops accepting new invocations, drains in-flight ones for up to `--shutdown-timeout`, then stops and removes every container it manages (labeled `mini-lambda.managed=true`) and exits `0`.
+
+That covers graceful exits. A daemon that is `SIGKILL`ed or crashes can't clean up after itself, so every container is also stamped with its owner's identity — a per-run instance id (`mini-lambda.instance`), the owner pid (`mini-lambda.owner-pid`), and the owner host (`mini-lambda.owner-host`). On startup the reaper (default on; `--reap-orphans=false` disables) lists managed containers and removes any whose owning daemon is dead, decided as:
+
+- **own instance** → keep (never touch a container from this run).
+- **different `owner-host`** → keep (pid liveness is only meaningful on the same host).
+- **owner pid missing/invalid** → remove (unattributable orphan on this host).
+- **owner pid still a live process** → keep (a peer daemon owns it — this is what lets parallel CI jobs share one docker host safely).
+- **owner pid dead** → remove (its daemon died uncleanly).
+
+Because the rule keys on pid liveness on the same host, two live daemons never reap each other's containers, while a dead daemon's containers are reclaimed by the next startup. Limitations: pid *reuse* can make a dead owner look alive, in which case its orphan is simply left for a later startup (we err toward leaking, never toward reaping a live peer's container); and a docker daemon shared across multiple hosts is out of scope (foreign-host containers are never reaped).
 
 ### `function`
 

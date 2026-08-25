@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/ajmcquilkin/mini-lambda/internal/api"
 	"github.com/ajmcquilkin/mini-lambda/internal/apierror"
@@ -34,8 +37,16 @@ const DefaultReachableHostname = "host.docker.internal"
 // host-gateway address inside each container.
 const hostGatewayExtraHost = DefaultReachableHostname + ":host-gateway"
 
-// shutdownTimeout bounds the graceful drain of each HTTP server.
-const shutdownTimeout = 15 * time.Second
+// defaultShutdownTimeout bounds the graceful drain when Config.ShutdownTimeout
+// is unset.
+const defaultShutdownTimeout = 20 * time.Second
+
+// readyLinePrefix is the machine-parseable stdout readiness contract. It is
+// emitted exactly once, only when the daemon is genuinely ready to serve
+// (migrations run, both listeners bound and serving, docker ping attempted).
+// CI tooling parses it to discover the resolved listen addresses, so its format
+// is an API: "MINI_LAMBDA_READY api=<host:port> runtime=<host:port>".
+const readyLinePrefix = "MINI_LAMBDA_READY"
 
 // Config configures the daemon.
 type Config struct {
@@ -51,6 +62,21 @@ type Config struct {
 	PerFunctionConcurrency int
 	IdleTTL                time.Duration
 
+	// PortFile, if non-empty, is a path the daemon atomically writes a JSON
+	// document to at the readiness moment: {"api":"<host:port>","runtime":
+	// "<host:port>"}. It is best-effort removed on shutdown. Pair it with a ":0"
+	// --addr so callers can discover the OS-chosen port without scraping stdout.
+	PortFile string
+
+	// ShutdownTimeout bounds the graceful drain on SIGTERM/SIGINT: in-flight
+	// invocations get up to this long before containers are force-stopped. Zero
+	// selects defaultShutdownTimeout.
+	ShutdownTimeout time.Duration
+
+	// ReapOrphans enables the startup reaper that removes managed containers
+	// whose owning daemon has died. Default-on at the CLI; the flag disables it.
+	ReapOrphans bool
+
 	// ReachableHostname overrides DefaultReachableHostname (mainly for tests).
 	ReachableHostname string
 
@@ -59,10 +85,11 @@ type Config struct {
 }
 
 type daemon struct {
-	cfg   Config
-	store store.Store
-	rt    runtime.Runtime
-	sched *scheduler.Engine
+	cfg    Config
+	store  store.Store
+	rt     runtime.Runtime
+	sched  *scheduler.Engine
+	pinger dockerPinger
 }
 
 func (c Config) logf(format string, args ...any) {
@@ -95,6 +122,17 @@ func Run(ctx context.Context, cfg Config) error {
 	// invocations (not the control plane) depend on it.
 	cfg.logf("%s", checkDocker(ctx, rt))
 
+	// This daemon run's ownership identity. Every container we create is stamped
+	// with it so a later daemon's startup reaper can tell our containers (and a
+	// live peer's) from a dead run's orphans.
+	self := newOwnerID(uuid.NewString())
+
+	// Reap orphaned containers left by daemons that died uncleanly before we
+	// begin serving. Best-effort: it never blocks startup on docker trouble.
+	if cfg.ReapOrphans {
+		reapOrphans(ctx, rt, self, pidAlive, cfg.logf)
+	}
+
 	// Bind the Runtime API listener first so we know its port before building the
 	// scheduler, which bakes "<host>:<port>/<token>" into each container's env.
 	runtimeLn, err := net.Listen("tcp", cfg.RuntimeAddr)
@@ -109,9 +147,10 @@ func Run(ctx context.Context, cfg Config) error {
 		MaxConcurrency:         cfg.MaxConcurrency,
 		PerFunctionConcurrency: cfg.PerFunctionConcurrency,
 		IdleTTL:                cfg.IdleTTL,
+		InstanceLabels:         self.labels(),
 	})
 
-	d := &daemon{cfg: cfg, store: st, rt: rt, sched: sched}
+	d := &daemon{cfg: cfg, store: st, rt: rt, sched: sched, pinger: rt}
 
 	runtimeSrv := &http.Server{Handler: runtimeapi.New(sched)}
 	apiSrv := &http.Server{Addr: cfg.Addr, Handler: d.publicHandler()}
@@ -126,7 +165,23 @@ func Run(ctx context.Context, cfg Config) error {
 	go func() { serveErr <- ignoreClosed(runtimeSrv.Serve(runtimeLn)) }()
 	go func() { serveErr <- ignoreClosed(apiSrv.Serve(apiLn)) }()
 
-	cfg.logf("%s", startupLine(cfg.Addr, runtimeLn.Addr(), reachable))
+	// Readiness moment: migrations ran, both listeners are bound and serving, and
+	// docker was pinged. Everything below keys off the RESOLVED listener
+	// addresses (never the flag strings) so a ":0" port is discoverable.
+	apiAddr := apiLn.Addr().String()
+	runtimeResolved := runtimeLn.Addr().String()
+
+	cfg.logf("%s", startupLine(apiAddr, runtimeLn.Addr(), reachable))
+	if cfg.PortFile != "" {
+		if err := writePortFile(cfg.PortFile, apiAddr, runtimeResolved); err != nil {
+			cfg.logf("WARNING: write --port-file %q: %v", cfg.PortFile, err)
+		} else {
+			defer removePortFile(cfg.PortFile, cfg.logf)
+		}
+	}
+	// The machine-parseable readiness contract, emitted exactly once, last, so a
+	// reader that has seen it knows every other readiness step is done.
+	cfg.logf("%s", readyLine(apiAddr, runtimeResolved))
 
 	select {
 	case <-ctx.Done():
@@ -142,8 +197,15 @@ func Run(ctx context.Context, cfg Config) error {
 }
 
 // shutdown stops the scheduler (killing containers) then drains both servers.
+// The public API is stopped first (so in-flight invokes get to finish within
+// the timeout while no new ones arrive), then slots are reaped, then the Runtime
+// API listener the now-dead RICs were polling is dropped.
 func (d *daemon) shutdown(runtimeSrv, apiSrv *http.Server) {
-	sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	timeout := d.cfg.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = defaultShutdownTimeout
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	// Stop the public API first so no new invocations arrive, then reap slots,
@@ -189,7 +251,46 @@ func (d *daemon) publicHandler() http.Handler {
 	mux.Handle("/", api.New(d.store, d.sched))
 	lh := &logsHandler{fns: d.store, containers: d.sched, logs: d.rt}
 	mux.HandleFunc("GET /mini-lambda/functions/{name}/logs", lh.handle)
+	hh := &healthzHandler{pinger: d.pinger}
+	mux.HandleFunc("GET /healthz", hh.handle)
 	return mux
+}
+
+// healthzHandler serves the readiness probe. The daemon being up (serving HTTP)
+// is the entire signal — CI needs "the daemon is up", not "docker is up" — so
+// the status code is always 200 once serving. Docker reachability is reported
+// as an informational field only and never flips the code.
+type healthzHandler struct {
+	pinger dockerPinger
+}
+
+// handle returns 200 with a small JSON body. If a pinger is wired it does a
+// short, bounded docker ping to fill the informational "docker" field.
+func (h *healthzHandler) handle(w http.ResponseWriter, r *http.Request) {
+	dockerOK := false
+	if h.pinger != nil {
+		pctx, cancel := context.WithTimeout(r.Context(), healthzPingTimeout)
+		defer cancel()
+		dockerOK = h.pinger.Ping(pctx) == nil
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(healthzBody(dockerOK))
+}
+
+// healthzPingTimeout bounds the informational docker ping in /healthz so a
+// hung docker daemon can't stall the readiness probe.
+const healthzPingTimeout = 750 * time.Millisecond
+
+// healthzBody renders the /healthz JSON. status is always "ok" (the daemon is
+// serving); docker is informational ("ok"|"unreachable").
+func healthzBody(dockerOK bool) []byte {
+	docker := "unreachable"
+	if dockerOK {
+		docker = "ok"
+	}
+	b, _ := json.Marshal(map[string]string{"status": "ok", "docker": docker})
+	return b
 }
 
 // handle streams combined logs from a function's live slot containers. Logs are
@@ -303,6 +404,56 @@ func dockerStatusLine(p dockerPinger, pingErr error) string {
 // already-resolved "host:port" string (from reachableHost), not the function.
 func startupLine(apiAddr string, runtimeAddr net.Addr, reachable string) string {
 	return fmt.Sprintf("mini-lambda daemon listening: api=%s runtime-api=%s (reachable as %s)", apiAddr, runtimeAddr, reachable)
+}
+
+// readyLine renders the machine-parseable readiness contract from the RESOLVED
+// listener addresses. Format is stable and tested: callers parse it to learn
+// the OS-chosen ports when they bind ":0".
+func readyLine(apiAddr, runtimeAddr string) string {
+	return fmt.Sprintf("%s api=%s runtime=%s", readyLinePrefix, apiAddr, runtimeAddr)
+}
+
+// portFile is the JSON document written by --port-file.
+type portFile struct {
+	API     string `json:"api"`
+	Runtime string `json:"runtime"`
+}
+
+// writePortFile atomically writes the resolved listen addresses to path as
+// JSON. It writes a temp file in the destination directory and renames it into
+// place so a reader never observes a partial document.
+func writePortFile(path, apiAddr, runtimeAddr string) error {
+	data, err := json.Marshal(portFile{API: apiAddr, Runtime: runtimeAddr})
+	if err != nil {
+		return err
+	}
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".mini-lambda-port-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
+}
+
+// removePortFile best-effort deletes the port file on shutdown.
+func removePortFile(path string, logf func(string, ...any)) {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		logf("remove --port-file %q: %v", path, err)
+	}
 }
 
 // listenerPort extracts the TCP port a listener bound to. It returns 0 for a

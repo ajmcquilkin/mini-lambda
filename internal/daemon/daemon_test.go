@@ -2,11 +2,15 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -91,6 +95,115 @@ func TestStartupLine(t *testing.T) {
 	assert.Contains(t, got, reachable)
 	assert.NotContains(t, got, "%!")
 	assert.Equal(t, "mini-lambda daemon listening: api=127.0.0.1:9000 runtime-api=0.0.0.0:9001 (reachable as host.docker.internal:9001)", got)
+}
+
+func TestReadyLine(t *testing.T) {
+	// The READY line is a machine-parseable API: its exact shape is contractual.
+	got := readyLine("127.0.0.1:54321", "0.0.0.0:9001")
+	assert.Equal(t, "MINI_LAMBDA_READY api=127.0.0.1:54321 runtime=0.0.0.0:9001", got)
+	assert.True(t, strings.HasPrefix(got, "MINI_LAMBDA_READY "))
+	assert.NotContains(t, got, "%!")
+}
+
+func TestReadyLineUsesResolvedEphemeralPort(t *testing.T) {
+	// Binding ":0" must surface the OS-chosen port through the resolved
+	// listener address the READY line is built from — never the flag string.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+
+	resolved := ln.Addr().String()
+	port := listenerPort(ln.Addr())
+	require.NotZero(t, port, "OS must assign a concrete port for :0")
+
+	line := readyLine(resolved, "0.0.0.0:0")
+	assert.Contains(t, line, "api="+resolved)
+	assert.Contains(t, line, ":"+strconv.Itoa(port))
+	assert.NotContains(t, line, ":0 ")
+}
+
+func TestWritePortFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ports.json")
+
+	require.NoError(t, writePortFile(path, "127.0.0.1:9000", "0.0.0.0:9001"))
+
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+
+	var pf portFile
+	require.NoError(t, json.Unmarshal(data, &pf))
+	assert.Equal(t, "127.0.0.1:9000", pf.API)
+	assert.Equal(t, "0.0.0.0:9001", pf.Runtime)
+	// Exact JSON shape is part of the contract for tooling that greps it.
+	assert.JSONEq(t, `{"api":"127.0.0.1:9000","runtime":"0.0.0.0:9001"}`, string(data))
+}
+
+func TestWritePortFileAtomicRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ports.json")
+
+	require.NoError(t, writePortFile(path, "a:1", "b:2"))
+
+	// The temp files must be renamed away, not left littering the dir.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "ports.json", entries[0].Name())
+}
+
+func TestRemovePortFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ports.json")
+	require.NoError(t, writePortFile(path, "a:1", "b:2"))
+
+	removePortFile(path, func(string, ...any) {})
+	_, err := os.Stat(path)
+	assert.True(t, os.IsNotExist(err))
+
+	// Removing a missing file is a silent no-op (no log line).
+	logged := false
+	removePortFile(path, func(string, ...any) { logged = true })
+	assert.False(t, logged)
+}
+
+func TestHealthzBody(t *testing.T) {
+	assert.JSONEq(t, `{"status":"ok","docker":"ok"}`, string(healthzBody(true)))
+	assert.JSONEq(t, `{"status":"ok","docker":"unreachable"}`, string(healthzBody(false)))
+}
+
+func serveHealthz(t *testing.T, h *healthzHandler) *http.Response {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", h.handle)
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil).WithContext(t.Context())
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec.Result()
+}
+
+func TestHealthzAlwaysOKRegardlessOfDocker(t *testing.T) {
+	tests := []struct {
+		name       string
+		pinger     dockerPinger
+		wantDocker string
+	}{
+		{"docker reachable", fakePinger{}, "ok"},
+		{"docker unreachable", fakePinger{pingErr: errors.New("down")}, "unreachable"},
+		{"no pinger wired", nil, "unreachable"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res := serveHealthz(t, &healthzHandler{pinger: tt.pinger})
+			defer res.Body.Close()
+
+			// The daemon being up is the whole signal: 200 no matter what docker does.
+			assert.Equal(t, http.StatusOK, res.StatusCode)
+			assert.Equal(t, "application/json", res.Header.Get("Content-Type"))
+
+			body, err := io.ReadAll(res.Body)
+			require.NoError(t, err)
+			assert.JSONEq(t, `{"status":"ok","docker":"`+tt.wantDocker+`"}`, string(body))
+		})
+	}
 }
 
 // fakePinger is a hand-rolled dockerPinger: Ping returns pingErr and Endpoint

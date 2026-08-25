@@ -19,6 +19,7 @@ const (
 	defaultMaxConcurrency         = 32
 	defaultPerFunctionConcurrency = 4
 	defaultIdleTTL                = 5 * time.Minute
+	defaultShutdownTimeout        = 20 * time.Second
 )
 
 // NewCmd builds the `serve` command that runs the mini-lambda daemon.
@@ -34,6 +35,9 @@ func NewCmd() *cobra.Command {
 			maxConc, _ := cmd.Flags().GetInt("max-concurrency")
 			perFn, _ := cmd.Flags().GetInt("per-function-concurrency")
 			idleTTL, _ := cmd.Flags().GetDuration("idle-ttl")
+			portFile, _ := cmd.Flags().GetString("port-file")
+			shutdownTimeout, _ := cmd.Flags().GetDuration("shutdown-timeout")
+			reapOrphans, _ := cmd.Flags().GetBool("reap-orphans")
 
 			resolvedData, err := resolveDataDir(dataDir)
 			if err != nil {
@@ -50,6 +54,9 @@ func NewCmd() *cobra.Command {
 				MaxConcurrency:         maxConc,
 				PerFunctionConcurrency: perFn,
 				IdleTTL:                idleTTL,
+				PortFile:               portFile,
+				ShutdownTimeout:        shutdownTimeout,
+				ReapOrphans:            reapOrphans,
 				Logf: func(format string, a ...any) {
 					cmd.Printf(format+"\n", a...)
 				},
@@ -63,6 +70,9 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().Int("max-concurrency", defaultMaxConcurrency, "daemon-wide max concurrent slots")
 	cmd.Flags().Int("per-function-concurrency", defaultPerFunctionConcurrency, "per-function max concurrent slots")
 	cmd.Flags().Duration("idle-ttl", defaultIdleTTL, "idle slot time-to-live before reaping")
+	cmd.Flags().String("port-file", "", "atomically write {\"api\":...,\"runtime\":...} resolved listen addresses to this path at readiness (removed on shutdown)")
+	cmd.Flags().Duration("shutdown-timeout", defaultShutdownTimeout, "max time to drain in-flight invocations on SIGTERM/SIGINT before force-stopping containers")
+	cmd.Flags().Bool("reap-orphans", true, "on startup, remove managed containers whose owning daemon has died")
 
 	return cmd
 }

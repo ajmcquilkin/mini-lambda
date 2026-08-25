@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "daemon",
-    srcs = ["daemon.go"],
+    srcs = [
+        "daemon.go",
+        "reap.go",
+    ],
     importpath = "github.com/ajmcquilkin/mini-lambda/internal/daemon",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -14,15 +17,20 @@ go_library(
         "//internal/runtimeapi",
         "//internal/scheduler",
         "//internal/store",
+        "@com_github_google_uuid//:uuid",
     ],
 )
 
 go_test(
     name = "daemon_test",
-    srcs = ["daemon_test.go"],
+    srcs = [
+        "daemon_test.go",
+        "reap_test.go",
+    ],
     embed = [":daemon"],
     deps = [
         "//internal/model",
+        "//internal/runtime/docker",
         "//internal/store",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
