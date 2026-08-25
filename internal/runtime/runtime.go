@@ -31,6 +31,12 @@ type ContainerSpec struct {
 	// "host.docker.internal:host-gateway" so the container can reach the
 	// daemon's Runtime API listener on the host.
 	ExtraHosts []string
+
+	// Labels are extra container labels the runtime stamps alongside its own
+	// managed label. The scheduler uses these to record per-daemon ownership
+	// (instance id, owner pid/host) so a later daemon's startup reaper can
+	// identify and remove containers whose owning daemon has died.
+	Labels map[string]string
 }
 
 // Runtime manages images and containers for function invocations.

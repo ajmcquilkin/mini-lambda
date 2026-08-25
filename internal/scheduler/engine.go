@@ -41,6 +41,12 @@ type Config struct {
 	// "host.docker.internal:host-gateway" so the container can reach ReachableHost.
 	ExtraHosts []string
 
+	// InstanceLabels are stamped on every container the engine creates, on top
+	// of the runtime's own managed label. The daemon supplies per-run ownership
+	// labels (instance id, owner pid/host) so a later daemon's startup reaper can
+	// distinguish this run's containers from a dead run's orphans.
+	InstanceLabels map[string]string
+
 	// MaxConcurrency caps the total number of live slots (containers) daemon-wide.
 	MaxConcurrency int
 
@@ -263,6 +269,7 @@ func (e *Engine) coldStart(ctx context.Context, fn *model.Function, s *slot) err
 			runtimeAPIEnvVar: e.cfg.ReachableHost + "/" + s.token,
 		},
 		ExtraHosts: e.cfg.ExtraHosts,
+		Labels:     e.cfg.InstanceLabels,
 	}
 
 	id, err := e.rt.Create(ctx, spec)
