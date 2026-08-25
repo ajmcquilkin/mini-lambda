@@ -97,10 +97,20 @@ func TestStartupLine(t *testing.T) {
 	assert.Equal(t, "mini-lambda daemon listening: api=127.0.0.1:9000 runtime-api=0.0.0.0:9001 (reachable as host.docker.internal:9001)", got)
 }
 
+// samplePortFile is a representative readiness document reused across the
+// contract tests.
+var samplePortFile = portFile{
+	API:              "127.0.0.1:54321",
+	Runtime:          "[::]:9001",
+	RuntimeReachable: "host.docker.internal:9001",
+	PID:              4242,
+}
+
 func TestReadyLine(t *testing.T) {
 	// The READY line is a machine-parseable API: its exact shape is contractual.
-	got := readyLine("127.0.0.1:54321", "0.0.0.0:9001")
-	assert.Equal(t, "MINI_LAMBDA_READY api=127.0.0.1:54321 runtime=0.0.0.0:9001", got)
+	// v2 adds runtime_reachable (the container-dialable host:port) and pid.
+	got := readyLine(samplePortFile)
+	assert.Equal(t, "MINI_LAMBDA_READY api=127.0.0.1:54321 runtime=[::]:9001 runtime_reachable=host.docker.internal:9001 pid=4242", got)
 	assert.True(t, strings.HasPrefix(got, "MINI_LAMBDA_READY "))
 	assert.NotContains(t, got, "%!")
 }
@@ -116,33 +126,57 @@ func TestReadyLineUsesResolvedEphemeralPort(t *testing.T) {
 	port := listenerPort(ln.Addr())
 	require.NotZero(t, port, "OS must assign a concrete port for :0")
 
-	line := readyLine(resolved, "0.0.0.0:0")
+	line := readyLine(portFile{API: resolved, Runtime: resolved, RuntimeReachable: "host.docker.internal:" + strconv.Itoa(port), PID: 1})
+	// The api field carries the resolved (non-zero) port, not the ":0" flag.
 	assert.Contains(t, line, "api="+resolved)
-	assert.Contains(t, line, ":"+strconv.Itoa(port))
-	assert.NotContains(t, line, ":0 ")
+	assert.NotContains(t, line, "api=127.0.0.1:0 ")
+}
+
+func TestShutdownLine(t *testing.T) {
+	// The shutdown line is a machine-parseable API too: exact strings matter.
+	assert.Equal(t, "MINI_LAMBDA_SHUTDOWN complete", shutdownLine(false))
+	assert.Equal(t, "MINI_LAMBDA_SHUTDOWN forced", shutdownLine(true))
+	assert.True(t, strings.HasPrefix(shutdownLine(false), "MINI_LAMBDA_SHUTDOWN "))
 }
 
 func TestWritePortFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ports.json")
 
-	require.NoError(t, writePortFile(path, "127.0.0.1:9000", "0.0.0.0:9001"))
+	require.NoError(t, writePortFile(path, defaultPortFileMode, samplePortFile))
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 
 	var pf portFile
 	require.NoError(t, json.Unmarshal(data, &pf))
-	assert.Equal(t, "127.0.0.1:9000", pf.API)
-	assert.Equal(t, "0.0.0.0:9001", pf.Runtime)
-	// Exact JSON shape is part of the contract for tooling that greps it.
-	assert.JSONEq(t, `{"api":"127.0.0.1:9000","runtime":"0.0.0.0:9001"}`, string(data))
+	assert.Equal(t, samplePortFile, pf)
+	// Exact JSON shape (field names + order) is part of the contract for tooling.
+	assert.JSONEq(t, `{"api":"127.0.0.1:54321","runtime":"[::]:9001","runtime_reachable":"host.docker.internal:9001","pid":4242}`, string(data))
+}
+
+func TestWritePortFileMode(t *testing.T) {
+	// os.CreateTemp makes the temp 0600; the write must chmod it so the file is
+	// published with the requested (default world-readable) mode.
+	dir := t.TempDir()
+	def := filepath.Join(dir, "default.json")
+	require.NoError(t, writePortFile(def, defaultPortFileMode, samplePortFile))
+	info, err := os.Stat(def)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o644), info.Mode().Perm(), "default port file must be world-readable (0644)")
+
+	// A tighter mode is honored too (proving the chmod is real, not incidental).
+	tight := filepath.Join(dir, "tight.json")
+	require.NoError(t, writePortFile(tight, 0o600, samplePortFile))
+	info, err = os.Stat(tight)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 }
 
 func TestWritePortFileAtomicRename(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "ports.json")
 
-	require.NoError(t, writePortFile(path, "a:1", "b:2"))
+	require.NoError(t, writePortFile(path, defaultPortFileMode, samplePortFile))
 
 	// The temp files must be renamed away, not left littering the dir.
 	entries, err := os.ReadDir(dir)
@@ -153,7 +187,7 @@ func TestWritePortFileAtomicRename(t *testing.T) {
 
 func TestRemovePortFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ports.json")
-	require.NoError(t, writePortFile(path, "a:1", "b:2"))
+	require.NoError(t, writePortFile(path, defaultPortFileMode, samplePortFile))
 
 	removePortFile(path, func(string, ...any) {})
 	_, err := os.Stat(path)

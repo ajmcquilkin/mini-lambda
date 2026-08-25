@@ -70,7 +70,7 @@ func NewCmd() *cobra.Command {
 	cmd.Flags().Int("max-concurrency", defaultMaxConcurrency, "daemon-wide max concurrent slots")
 	cmd.Flags().Int("per-function-concurrency", defaultPerFunctionConcurrency, "per-function max concurrent slots")
 	cmd.Flags().Duration("idle-ttl", defaultIdleTTL, "idle slot time-to-live before reaping")
-	cmd.Flags().String("port-file", "", "atomically write {\"api\":...,\"runtime\":...} resolved listen addresses to this path at readiness (removed on shutdown)")
+	cmd.Flags().String("port-file", "", "atomically write the readiness JSON (api, runtime, runtime_reachable, pid) to this path at readiness; 0644, removed on shutdown")
 	cmd.Flags().Duration("shutdown-timeout", defaultShutdownTimeout, "max time to drain in-flight invocations on SIGTERM/SIGINT before force-stopping containers")
 	cmd.Flags().Bool("reap-orphans", true, "on startup, remove managed containers whose owning daemon has died")
 

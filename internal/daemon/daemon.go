@@ -45,8 +45,21 @@ const defaultShutdownTimeout = 20 * time.Second
 // emitted exactly once, only when the daemon is genuinely ready to serve
 // (migrations run, both listeners bound and serving, docker ping attempted).
 // CI tooling parses it to discover the resolved listen addresses, so its format
-// is an API: "MINI_LAMBDA_READY api=<host:port> runtime=<host:port>".
+// is an API:
+//
+//	MINI_LAMBDA_READY api=<host:port> runtime=<host:port> runtime_reachable=<host:port> pid=<n>
 const readyLinePrefix = "MINI_LAMBDA_READY"
+
+// shutdownLinePrefix is the machine-parseable stdout shutdown contract, emitted
+// exactly once as the last thing before a clean exit: "MINI_LAMBDA_SHUTDOWN
+// complete" on a clean drain, or "MINI_LAMBDA_SHUTDOWN forced" when the
+// --shutdown-timeout bound elapsed before in-flight invocations finished.
+const shutdownLinePrefix = "MINI_LAMBDA_SHUTDOWN"
+
+// defaultPortFileMode is the port file's permission bits. Ports are not
+// secrets, so it is world-readable to let a cross-user harness read the file the
+// daemon (possibly root, under sudo) wrote.
+const defaultPortFileMode = os.FileMode(0o644)
 
 // Config configures the daemon.
 type Config struct {
@@ -63,9 +76,11 @@ type Config struct {
 	IdleTTL                time.Duration
 
 	// PortFile, if non-empty, is a path the daemon atomically writes a JSON
-	// document to at the readiness moment: {"api":"<host:port>","runtime":
-	// "<host:port>"}. It is best-effort removed on shutdown. Pair it with a ":0"
-	// --addr so callers can discover the OS-chosen port without scraping stdout.
+	// document to at the readiness moment (see portFile). It is best-effort
+	// removed on shutdown. Pair it with a ":0" --addr so callers can discover the
+	// OS-chosen port without scraping stdout. It is written world-readable
+	// (defaultPortFileMode) so a cross-user harness can read what the daemon
+	// (possibly root, under sudo) wrote — ports are not secrets.
 	PortFile string
 
 	// ShutdownTimeout bounds the graceful drain on SIGTERM/SIGINT: in-flight
@@ -171,9 +186,17 @@ func Run(ctx context.Context, cfg Config) error {
 	apiAddr := apiLn.Addr().String()
 	runtimeResolved := runtimeLn.Addr().String()
 
+	// runtimeReachable is the host:port a container actually dials (what the
+	// daemon injects into AWS_LAMBDA_RUNTIME_API), not the bind address. It is
+	// reported alongside the raw listen addr so consumers don't have to
+	// substitute the host themselves. pid lets a harness signal the daemon binary
+	// directly (important under sudo, where TERM to the wrapper may not relay).
+	pid := os.Getpid()
+	pf := portFile{API: apiAddr, Runtime: runtimeResolved, RuntimeReachable: reachable, PID: pid}
+
 	cfg.logf("%s", startupLine(apiAddr, runtimeLn.Addr(), reachable))
 	if cfg.PortFile != "" {
-		if err := writePortFile(cfg.PortFile, apiAddr, runtimeResolved); err != nil {
+		if err := writePortFile(cfg.PortFile, defaultPortFileMode, pf); err != nil {
 			cfg.logf("WARNING: write --port-file %q: %v", cfg.PortFile, err)
 		} else {
 			defer removePortFile(cfg.PortFile, cfg.logf)
@@ -181,7 +204,7 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	// The machine-parseable readiness contract, emitted exactly once, last, so a
 	// reader that has seen it knows every other readiness step is done.
-	cfg.logf("%s", readyLine(apiAddr, runtimeResolved))
+	cfg.logf("%s", readyLine(pf))
 
 	select {
 	case <-ctx.Done():
@@ -192,7 +215,10 @@ func Run(ctx context.Context, cfg Config) error {
 		return err
 	}
 
-	d.shutdown(runtimeSrv, apiSrv)
+	// Clean shutdown path: drain, then emit the machine-parseable shutdown
+	// contract as the very last line before exit 0.
+	forced := d.shutdown(runtimeSrv, apiSrv)
+	cfg.logf("%s", shutdownLine(forced))
 	return nil
 }
 
@@ -200,7 +226,12 @@ func Run(ctx context.Context, cfg Config) error {
 // The public API is stopped first (so in-flight invokes get to finish within
 // the timeout while no new ones arrive), then slots are reaped, then the Runtime
 // API listener the now-dead RICs were polling is dropped.
-func (d *daemon) shutdown(runtimeSrv, apiSrv *http.Server) {
+//
+// It returns forced=true when the --shutdown-timeout bound elapsed before the
+// in-flight invocations drained (http.Server.Shutdown reports the deadline via
+// a context error), meaning containers were torn down without finishing their
+// work. A clean drain returns false.
+func (d *daemon) shutdown(runtimeSrv, apiSrv *http.Server) (forced bool) {
 	timeout := d.cfg.ShutdownTimeout
 	if timeout <= 0 {
 		timeout = defaultShutdownTimeout
@@ -209,12 +240,16 @@ func (d *daemon) shutdown(runtimeSrv, apiSrv *http.Server) {
 	defer cancel()
 
 	// Stop the public API first so no new invocations arrive, then reap slots,
-	// then drop the Runtime API listener the (now dead) RICs were polling.
-	_ = apiSrv.Shutdown(sctx)
+	// then drop the Runtime API listener the (now dead) RICs were polling. A
+	// deadline hit here means in-flight invokes didn't finish in the budget.
+	if err := apiSrv.Shutdown(sctx); errors.Is(err, context.DeadlineExceeded) {
+		forced = true
+	}
 	if err := d.sched.Shutdown(sctx); err != nil {
 		d.cfg.logf("scheduler shutdown: %v", err)
 	}
 	_ = runtimeSrv.Shutdown(sctx)
+	return forced
 }
 
 // functionExister confirms a function exists before its logs are streamed. It
@@ -406,24 +441,41 @@ func startupLine(apiAddr string, runtimeAddr net.Addr, reachable string) string 
 	return fmt.Sprintf("mini-lambda daemon listening: api=%s runtime-api=%s (reachable as %s)", apiAddr, runtimeAddr, reachable)
 }
 
-// readyLine renders the machine-parseable readiness contract from the RESOLVED
-// listener addresses. Format is stable and tested: callers parse it to learn
-// the OS-chosen ports when they bind ":0".
-func readyLine(apiAddr, runtimeAddr string) string {
-	return fmt.Sprintf("%s api=%s runtime=%s", readyLinePrefix, apiAddr, runtimeAddr)
+// readyLine renders the machine-parseable readiness contract from the same
+// resolved values written to the port file. Format is stable and tested:
+// callers parse it to learn the OS-chosen ports (when binding ":0"), the
+// container-reachable runtime address, and the daemon pid.
+func readyLine(pf portFile) string {
+	return fmt.Sprintf("%s api=%s runtime=%s runtime_reachable=%s pid=%d",
+		readyLinePrefix, pf.API, pf.Runtime, pf.RuntimeReachable, pf.PID)
 }
 
-// portFile is the JSON document written by --port-file.
+// shutdownLine renders the machine-parseable shutdown contract. forced reports
+// whether the --shutdown-timeout bound cut the in-flight drain short.
+func shutdownLine(forced bool) string {
+	if forced {
+		return shutdownLinePrefix + " forced"
+	}
+	return shutdownLinePrefix + " complete"
+}
+
+// portFile is the JSON document written by --port-file. api/runtime are the
+// resolved listen addresses; runtime_reachable is the host:port a container
+// actually dials (what AWS_LAMBDA_RUNTIME_API is set to); pid is the daemon
+// process id (signal it directly, especially under sudo).
 type portFile struct {
-	API     string `json:"api"`
-	Runtime string `json:"runtime"`
+	API              string `json:"api"`
+	Runtime          string `json:"runtime"`
+	RuntimeReachable string `json:"runtime_reachable"`
+	PID              int    `json:"pid"`
 }
 
-// writePortFile atomically writes the resolved listen addresses to path as
-// JSON. It writes a temp file in the destination directory and renames it into
-// place so a reader never observes a partial document.
-func writePortFile(path, apiAddr, runtimeAddr string) error {
-	data, err := json.Marshal(portFile{API: apiAddr, Runtime: runtimeAddr})
+// writePortFile atomically writes pf to path as JSON with the given mode. It
+// writes a temp file in the destination directory, chmods it (os.CreateTemp
+// makes it 0600, so an explicit chmod is required to honor a laxer mode), then
+// renames it into place so a reader never observes a partial document.
+func writePortFile(path string, mode os.FileMode, pf portFile) error {
+	data, err := json.Marshal(pf)
 	if err != nil {
 		return err
 	}
@@ -439,6 +491,12 @@ func writePortFile(path, apiAddr, runtimeAddr string) error {
 		return err
 	}
 	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	// os.CreateTemp always makes the temp 0600; set the requested mode before
+	// the rename so the file is atomically published with its final perms.
+	if err := os.Chmod(tmpName, mode); err != nil {
 		os.Remove(tmpName)
 		return err
 	}
